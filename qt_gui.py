@@ -2,14 +2,28 @@ import os
 import cv2
 import pyaudio
 import numpy as np
+import sys
 from PyQt6.QtCore import Qt, QThread, QTimer, QSize, QRunnable, pyqtSlot, QPropertyAnimation, QEasingCurve
-from PyQt6.QtGui import QImage, QPixmap, QActionGroup, QIcon, QFont
+from PyQt6.QtGui import QImage, QPixmap, QActionGroup, QIcon, QFont, QAction
 from PyQt6.QtWidgets import QMainWindow, QVBoxLayout, QHBoxLayout, QGridLayout, QDockWidget \
     , QLabel, QWidget, QListWidget, QListWidgetItem, QMessageBox \
     , QComboBox, QTextEdit, QLineEdit, QPushButton, QFileDialog \
     , QDialog, QMenu, QWidgetAction, QCheckBox, QStyleFactory, QGraphicsDropShadowEffect
 
 from constants import *
+
+# Screen capture integration from qijungu/screenshare
+ver = sys.version_info.major
+if ver == 2:
+    import StringIO as io
+elif ver == 3:
+    import io
+
+if sys.platform in ["win32", "darwin"]:
+    from PIL import ImageGrab as ig
+else:
+    import pyscreenshot as ig
+    bkend = "pygdk3"  # or other backend if needed
 
 # Camera
 CAMERA_RES = '240p'
@@ -21,7 +35,6 @@ frame_size = {
     '560p': (800, 560),
     '720p': (1080, 720),
     '900p': (1400, 900),
-    # '1080p': (1920, 1080)
 }
 FRAME_WIDTH = frame_size[CAMERA_RES][0]
 FRAME_HEIGHT = frame_size[CAMERA_RES][1]
@@ -45,7 +58,7 @@ SAMPLE_RATE = 48000
 BLOCK_SIZE = 2048
 pa = pyaudio.PyAudio()
 
-# Modern Stylesheet (box-shadow removed; shadows handled programmatically with QGraphicsDropShadowEffect)
+# Modern Stylesheet
 MODERN_STYLESHEET = """
 QMainWindow {
     background-color: #1e1e2e;
@@ -160,10 +173,22 @@ QMessageBox {
 """
 
 
+class PersistentMenu(QMenu):
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            action = self.actionAt(event.pos())
+            if action and isinstance(action, QWidgetAction):
+                widget = action.defaultWidget()
+                if isinstance(widget, QCheckBox):
+                    widget.setChecked(not widget.isChecked())
+                event.ignore()
+                return
+        super().mouseReleaseEvent(event)
+
+
 class Worker(QRunnable):
     def __init__(self, fn, *args, **kwargs):
         super(Worker, self).__init__()
-        # Store constructor arguments (re-used for processing)
         self.fn = fn
         self.args = args
         self.kwargs = kwargs
@@ -215,7 +240,6 @@ class AudioThread(QThread):
         self.connected = True
 
     def run(self):
-        # if this is the current client, then don't play audio
         if self.client.microphone is not None:
             return
         while self.connected:
@@ -233,7 +257,7 @@ class AudioThread(QThread):
 class Camera:
     def __init__(self):
         self.cap = None
-        for index in range(3):  # Try indices 0, 1, 2
+        for index in range(3):
             cap = cv2.VideoCapture(index)
             if cap.isOpened():
                 self.cap = cap
@@ -257,29 +281,19 @@ class Camera:
 
 class ScreenCapturer:
     def __init__(self):
-        self.sct = None
-        try:
-            import mss
-            self.sct = mss.mss()
-            # Force initialization in main thread to avoid threading issues
-            _ = self.sct.monitors
-            print("[INFO] ScreenCapturer initialized successfully")
-        except ImportError:
-            print("[ERROR] mss library not installed. Install with 'pip install mss' for screen sharing.")
-            self.sct = None
-        except Exception as e:
-            print(f"[ERROR] MSS initialization failed: {e}")
-            self.sct = None
+        print("[INFO] ScreenCapturer initialized with integrated capture method")
 
     def capture(self):
-        if self.sct is None:
-            print("[ERROR] ScreenCapturer not available")
-            return None
         try:
-            screenshot = self.sct.grab(self.sct.monitors[1])  # Primary monitor
+            if sys.platform in ["win32", "darwin"]:
+                screenshot = ig.grab()
+            else:
+                screenshot = ig.grab(backend=bkend)
             img = np.array(screenshot)
-            img = cv2.cvtColor(img, cv2.COLOR_BGRA2BGR)
-            # Compress
+            if sys.platform not in ["win32", "darwin"]:
+                img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+            else:
+                img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
             encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 85]
             _, img_encoded = cv2.imencode('.jpg', img, encode_param)
             print("[INFO] Screen captured successfully")
@@ -294,14 +308,11 @@ class VideoWidget(QWidget):
         super().__init__(parent)
         self.client = client
         self.init_ui()
-
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_video)
-
         self.init_video()
 
     def init_ui(self):
-        # self.resize(FRAME_WIDTH, FRAME_HEIGHT)
         self.setStyleSheet("border-radius: 12px; background-color: #313244;")
         shadow = QGraphicsDropShadowEffect()
         shadow.setBlurRadius(10)
@@ -337,7 +348,6 @@ class VideoWidget(QWidget):
         frame = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT), interpolation=cv2.INTER_AREA)
         
         if self.client.audio_data is None:
-            # replace bottom center part of the frame with nomic frame
             nomic_h, nomic_w, _ = NOMIC_FRAME.shape
             x, y = FRAME_WIDTH//2 - nomic_w//2, FRAME_HEIGHT - 50
             frame[y:y+nomic_h, x:x+nomic_w] = NOMIC_FRAME.copy()
@@ -348,10 +358,52 @@ class VideoWidget(QWidget):
         self.video_viewer.setPixmap(QPixmap.fromImage(q_img))
 
 
+class ScreenShareWidget(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.presenter_name = ""
+        self.init_ui()
+
+    def init_ui(self):
+        self.setStyleSheet("border-radius: 12px; background-color: #313244;")
+        shadow = QGraphicsDropShadowEffect()
+        shadow.setBlurRadius(10)
+        shadow.setColor(Qt.GlobalColor.black)
+        shadow.setOffset(0, 2)
+        self.setGraphicsEffect(shadow)
+
+        self.presenter_label = QLabel("Screen Share by: Unknown")
+        self.presenter_label.setStyleSheet("color: #f9e2af; font-weight: bold;")
+        self.screen_viewer = QLabel()
+        self.screen_viewer.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.screen_viewer.setStyleSheet("border: 2px solid #a6e3a1; border-radius: 12px; background-color: #313244;")
+        self.layout = QVBoxLayout()
+        self.layout.setSpacing(5)
+        self.layout.addWidget(self.presenter_label)
+        self.layout.addWidget(self.screen_viewer)
+        self.setLayout(self.layout)
+
+    def show_share(self, presenter_name, image_bytes):
+        self.presenter_name = presenter_name
+        self.presenter_label.setText(f"Screen Share by: {presenter_name}")
+        if image_bytes:
+            image = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_COLOR)
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            h, w, ch = image.shape
+            bytes_per_line = ch * w
+            q_img = QImage(image.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+            self.screen_viewer.setPixmap(QPixmap.fromImage(q_img).scaled(
+                QSize(1200, 800), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        else:
+            self.screen_viewer.setText("Waiting for screen share data...")
+
+
 class VideoListWidget(QListWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.all_items = {}
+        self.screen_share_item = None
+        self.screen_share_widget = None
         self.init_ui()
 
     def init_ui(self):
@@ -364,19 +416,39 @@ class VideoListWidget(QListWidget):
 
     def add_client(self, client):
         video_widget = VideoWidget(client)
-
         item = QListWidgetItem()
-        item.setFlags(item.flags() & ~(Qt.ItemFlag.ItemIsSelectable|Qt.ItemFlag.ItemIsEnabled))
+        item.setFlags(item.flags() & ~(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled))
         if client.current_device:
-            self.insertItem(0, item)
+            insert_index = 1 if self.screen_share_item else 0
+            self.insertItem(insert_index, item)
         else:
             self.addItem(item)
-        # item.setSizeHint(video_widget.sizeHint())
         item.setSizeHint(QSize(FRAME_WIDTH, FRAME_HEIGHT))
         self.setItemWidget(item, video_widget)
         self.all_items[client.name] = item
         self.resize_widgets()
-    
+
+    def add_screen_share(self, presenter_name, image_bytes):
+        if self.screen_share_item:
+            self.screen_share_widget.show_share(presenter_name, image_bytes)
+            return
+        self.screen_share_widget = ScreenShareWidget()
+        self.screen_share_item = QListWidgetItem()
+        self.screen_share_item.setFlags(self.screen_share_item.flags() & 
+                                      ~(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled))
+        self.screen_share_item.setSizeHint(QSize(1200, 800))
+        self.insertItem(0, self.screen_share_item)
+        self.setItemWidget(self.screen_share_item, self.screen_share_widget)
+        self.screen_share_widget.show_share(presenter_name, image_bytes)
+        self.resize_widgets()
+
+    def remove_screen_share(self):
+        if self.screen_share_item:
+            self.takeItem(self.row(self.screen_share_item))
+            self.screen_share_item = None
+            self.screen_share_widget = None
+            self.resize_widgets()
+
     def resize_widgets(self, res: str = None):
         global FRAME_WIDTH, FRAME_HEIGHT, LAYOUT_RES
         n = self.count()
@@ -398,7 +470,10 @@ class VideoListWidget(QListWidget):
             LAYOUT_RES = res
         
         for i in range(n):
-            self.item(i).setSizeHint(QSize(FRAME_WIDTH, FRAME_HEIGHT))
+            if self.item(i) == self.screen_share_item:
+                self.item(i).setSizeHint(QSize(1200, 800))
+            else:
+                self.item(i).setSizeHint(QSize(FRAME_WIDTH, FRAME_HEIGHT))
 
     def remove_client(self, name: str):
         self.takeItem(self.row(self.all_items[name]))
@@ -409,10 +484,11 @@ class VideoListWidget(QListWidget):
 class ChatWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.clients_checkboxes = {}
+        self.clients_menu_actions = {}
         self.init_ui()
 
     def init_ui(self):
-        # self.resize(800, 600)
         self.layout = QVBoxLayout()
         self.layout.setSpacing(10)
         self.setLayout(self.layout)
@@ -421,12 +497,10 @@ class ChatWidget(QWidget):
         self.central_widget.setReadOnly(True)
         self.layout.addWidget(self.central_widget)
 
-        self.clients_menu = QMenu("Clients", self)
-        self.clients_menu.aboutToShow.connect(self.resize_clients_menu)
-        self.clients_checkboxes = {}
-        self.clients_menu_actions = {}
-
-        self.select_all_checkbox, _ = self.add_client("") # Select All Checkbox
+        self.clients_menu = PersistentMenu("Clients", self)
+        select_all_action = QAction("Select All", self.clients_menu)
+        select_all_action.triggered.connect(self.select_all)
+        self.clients_menu.addAction(select_all_action)
         self.clients_menu.addSeparator()
 
         self.clients_button = QPushButton("Clients", self)
@@ -435,75 +509,38 @@ class ChatWidget(QWidget):
         self.layout.addWidget(self.clients_button)
 
         self.share_button = QPushButton("Share Screen", self)
-        self.share_button.setStyleSheet("background-color: #f9e2af; color: #1e1e2e;")
         self.layout.addWidget(self.share_button)
 
-        self.file_button = QPushButton("Send File", self)
-        self.file_button.setStyleSheet("background-color: #f5c2e7; color: #1e1e2e;")
-        self.layout.addWidget(self.file_button)
-
-        self.send_layout = QHBoxLayout()
-        self.send_layout.setSpacing(10)
-        self.layout.addLayout(self.send_layout)
-
+        self.line_layout = QHBoxLayout()
         self.line_edit = QLineEdit(self)
-        self.line_edit.setPlaceholderText("Type message here...")
-        self.line_edit.setStyleSheet("QLineEdit {border: 2px solid #9399b2; background-color: #313244;}"
-                                     "QLineEdit:focus {border: 2px solid #89b4fa;}")
-        self.send_layout.addWidget(self.line_edit)
-
         self.send_button = QPushButton("Send", self)
-        self.send_button.setStyleSheet("background-color: #a6e3a1; color: #1e1e2e; min-width: 60px;")
-        self.send_layout.addWidget(self.send_button)
-
-        self.layout.addSpacing(30)
+        self.file_button = QPushButton("File", self)
+        self.line_layout.addWidget(self.line_edit)
+        self.line_layout.addWidget(self.send_button)
+        self.line_layout.addWidget(self.file_button)
+        self.layout.addLayout(self.line_layout)
 
         self.end_button = QPushButton("End Call", self)
-        self.end_button.setStyleSheet("QPushButton {background-color: #f38ba8; color: #1e1e2e; font-weight: bold;}")
+        self.end_button.setStyleSheet("background-color: #f38ba8; color: #1e1e2e;")
         self.layout.addWidget(self.end_button)
-    
+
     def add_client(self, name: str):
+        if name in self.clients_checkboxes:
+            return
         checkbox = QCheckBox(name, self)
         checkbox.setChecked(True)
-        checkbox.setStyleSheet("QCheckBox { color: #cdd6f4; spacing: 5px; }")
-        action_widget = QWidgetAction(self)
-        action_widget.setDefaultWidget(checkbox)
-        self.clients_menu.addAction(action_widget)
-
-        if name == "": # Select All Checkbox
-            checkbox.setText("Select All")
-            checkbox.setStyleSheet("QCheckBox { color: #f9e2af; font-weight: bold; }")
-            checkbox.stateChanged.connect(
-                lambda state: self.on_checkbox_click(state, is_select_all=True)
-            )
-            return checkbox, action_widget
-        
-        checkbox.stateChanged.connect(
-            lambda state: self.on_checkbox_click(state)
-        )
+        action = QWidgetAction(self.clients_menu)
+        action.setDefaultWidget(checkbox)
+        self.clients_menu.addAction(action)
         self.clients_checkboxes[name] = checkbox
-        self.clients_menu_actions[name] = action_widget
-    
-    def remove_client(self, name: str):
-        self.clients_menu.removeAction(self.clients_menu_actions[name])
-        self.clients_menu_actions.pop(name)
-        self.clients_checkboxes.pop(name)
+        self.clients_menu_actions[name] = action
 
-    def resize_clients_menu(self):
-        self.clients_menu.setMinimumWidth(self.clients_button.width())
-    
-    def on_checkbox_click(self, is_checked: bool, is_select_all: bool = False):
-        if is_select_all:
-            for client_checkbox in self.clients_checkboxes.values():
-                client_checkbox.blockSignals(True)
-                client_checkbox.setChecked(is_checked)
-                client_checkbox.blockSignals(False)
-        else:
-            if not is_checked:
-                self.select_all_checkbox.blockSignals(True)
-                self.select_all_checkbox.setChecked(False)
-                self.select_all_checkbox.blockSignals(False)
-    
+    def remove_client(self, name: str):
+        if name in self.clients_menu_actions:
+            self.clients_menu.removeAction(self.clients_menu_actions[name])
+            del self.clients_checkboxes[name]
+            del self.clients_menu_actions[name]
+
     def selected_clients(self):
         selected = []
         for name, checkbox in self.clients_checkboxes.items():
@@ -511,70 +548,22 @@ class ChatWidget(QWidget):
                 selected.append(name)
         return tuple(selected)
 
-    def get_file(self):
-        file_path = QFileDialog.getOpenFileName(None, "Select File", options= QFileDialog.Option.DontUseNativeDialog)[0]
-        return file_path
-
     def get_text(self):
         text = self.line_edit.text()
         self.line_edit.clear()
         return text
-    
-    def add_msg(self, from_name: str, to_name: str, msg: str):
-        self.central_widget.append(f"<span style='color: #89b4fa'>[{from_name}]</span> <span style='color: #f9e2af'>→ {to_name}</span> <span style='color: #cdd6f4'>{msg}</span>")
 
+    def get_file(self):
+        filepath, _ = QFileDialog.getOpenFileName(self, "Select File")
+        return filepath
 
-class ScreenShareWidget(QWidget):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.init_ui()
-        self.hide()
+    def add_msg(self, from_name: str, to_names: str, msg: str):
+        formatted = f"[{from_name} -> {to_names}] {msg}\n"
+        self.central_widget.append(formatted)
 
-        self.presenter_label = QLabel("Screen Share by: ")
-        self.layout.addWidget(self.presenter_label, alignment=Qt.AlignmentFlag.AlignCenter)
-        self.screen_viewer = QLabel()
-        self.screen_viewer.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.screen_viewer.setStyleSheet("border: 2px solid #a6e3a1; border-radius: 12px; background-color: #313244;")
-        self.layout.addWidget(self.screen_viewer)
-        self.animation = QPropertyAnimation(self, b"windowOpacity")
-        self.animation.setDuration(300)
-        self.animation.setEasingCurve(QEasingCurve.Type.InOutQuad)
-
-    def init_ui(self):
-        self.setStyleSheet("background-color: rgba(30, 30, 46, 200); border-radius: 16px;")
-        self.layout = QVBoxLayout()
-        self.setLayout(self.layout)
-        shadow = QGraphicsDropShadowEffect()
-        shadow.setBlurRadius(20)
-        shadow.setColor(Qt.GlobalColor.black)
-        shadow.setOffset(0, 5)
-        self.setGraphicsEffect(shadow)
-
-    def show_share(self, presenter_name, image_bytes):
-        self.presenter_label.setText(f"Screen Share by: <span style='color: #f9e2af'>{presenter_name}</span>")
-        image = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_COLOR)
-        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-        h, w, ch = image.shape
-        bytes_per_line = ch * w
-        q_img = QImage(image.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
-        self.screen_viewer.setPixmap(QPixmap.fromImage(q_img).scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
-        if not self.isVisible():
-            self.setWindowOpacity(0)
-            self.show()
-            self.raise_()
-            self.animation.setStartValue(0)
-            self.animation.setEndValue(1)
-            self.animation.start()
-        else:
-            self.animation.setStartValue(self.windowOpacity())
-            self.animation.setEndValue(1)
-            self.animation.start()
-
-    def hide_share(self):
-        self.animation.setStartValue(self.windowOpacity())
-        self.animation.setEndValue(0)
-        self.animation.finished.connect(self.hide)
-        self.animation.start()
+    def select_all(self):
+        for checkbox in self.clients_checkboxes.values():
+            checkbox.setChecked(True)
 
 
 class LoginDialog(QDialog):
@@ -617,6 +606,7 @@ class LoginDialog(QDialog):
     def close(self):
         self.reject()
 
+
 class MainWindow(QMainWindow):
     def __init__(self, client, server_conn):
         super().__init__()
@@ -624,6 +614,7 @@ class MainWindow(QMainWindow):
         self.server_conn = server_conn
         self.audio_threads = {}
         self.screen_share_active = False
+        self.other_sharing = False
         self.current_presenter = None
 
         self.server_conn.add_client_signal.connect(self.add_client)
@@ -632,6 +623,7 @@ class MainWindow(QMainWindow):
         self.server_conn.screen_share_start_signal.connect(self.on_screen_share_start)
         self.server_conn.screen_share_stop_signal.connect(self.on_screen_share_stop)
         self.server_conn.screen_update_signal.connect(self.on_screen_update)
+        self.server_conn.screen_share_reject_signal.connect(self.on_screen_share_reject)
 
         self.login_dialog = LoginDialog(self)
         if not self.login_dialog.exec():
@@ -646,7 +638,6 @@ class MainWindow(QMainWindow):
         self.setGeometry(0, 0, 1920, 1000)
         self.setStyleSheet(MODERN_STYLESHEET)
 
-        # Create a central widget with a layout
         self.central_widget = QWidget()
         self.central_layout = QVBoxLayout()
         self.central_widget.setLayout(self.central_layout)
@@ -655,19 +646,9 @@ class MainWindow(QMainWindow):
         self.video_list_widget = VideoListWidget()
         self.central_layout.addWidget(self.video_list_widget)
         
-        self.overlay = QWidget(self)
-        self.overlay.setStyleSheet("background-color: rgba(0,0,0,0.5);")
-        self.overlay_layout = QVBoxLayout(self.overlay)
-        self.overlay_layout.setContentsMargins(50, 50, 50, 50)
-        self.overlay.setLayout(self.overlay_layout)
-        self.screen_share_widget = ScreenShareWidget(self)
-        self.overlay_layout.addWidget(self.screen_share_widget)
-        self.central_layout.addWidget(self.overlay)
-        self.overlay.hide()
-        
         self.sidebar = QDockWidget("Chat", self)
         self.sidebar.setFeatures(QDockWidget.DockWidgetFeature.NoDockWidgetFeatures)
-        self.chat_widget = ChatWidget()
+        self.chat_widget = ChatWidget(self)
         self.sidebar.setWidget(self.chat_widget)
         self.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, self.sidebar)
         self.chat_widget.send_button.clicked.connect(lambda: self.send_msg(TEXT))
@@ -676,12 +657,10 @@ class MainWindow(QMainWindow):
         self.chat_widget.share_button.clicked.connect(self.toggle_screen_share)
         self.chat_widget.end_button.clicked.connect(self.close)
 
-        # Screen sharing timer (runs in main thread)
         self.screen_timer = QTimer()
         self.screen_timer.timeout.connect(self.capture_and_send_screen)
-        self.screen_timer.setInterval(500)  # 2 FPS for screen sharing
+        self.screen_timer.setInterval(500)
         
-        # menus for camera and microphone toggle
         self.camera_menu = self.menuBar().addMenu("Camera")
         self.camera_menu.setStyleSheet("QMenu { background-color: #313244; color: #cdd6f4; }")
         self.microphone_menu = self.menuBar().addMenu("Microphone")
@@ -725,7 +704,7 @@ class MainWindow(QMainWindow):
     def remove_client(self, name: str):
         self.video_list_widget.remove_client(name)
         self.layout_actions[LAYOUT_RES].setChecked(True)
-        if ENABLE_AUDIO:
+        if ENABLE_AUDIO and name in self.audio_threads:
             self.audio_threads[name].connected = False
             self.audio_threads[name].wait()
             self.audio_threads.pop(name)
@@ -787,42 +766,50 @@ class MainWindow(QMainWindow):
         self.client.microphone_enabled = not self.client.microphone_enabled
 
     def toggle_screen_share(self):
-        if not self.screen_share_active:
-            # Request start
-            msg = Message(self.client.name, START_SHARE)
-            self.server_conn.send_msg(self.server_conn.main_socket, msg)
-            print("[INFO] Screen share start requested")
-        else:
-            # Request stop
+        if self.screen_share_active:
             msg = Message(self.client.name, STOP_SHARE)
             self.server_conn.send_msg(self.server_conn.main_socket, msg)
             print("[INFO] Screen share stop requested")
+        elif not self.other_sharing:
+            msg = Message(self.client.name, START_SHARE)
+            self.server_conn.send_msg(self.server_conn.main_socket, msg)
+            print("[INFO] Screen share start requested")
 
     def on_screen_share_start(self, presenter_name):
         print(f"[INFO] Screen share started by {presenter_name}")
         self.current_presenter = presenter_name
+        self.video_list_widget.add_screen_share(presenter_name, b'')
         if presenter_name == self.client.name:
-            # I am the presenter, start timer
             self.client.screen_sharing = True
-            self.screen_timer.start()
             self.screen_share_active = True
+            self.screen_timer.start()
             self.chat_widget.share_button.setText("Stop Screen Share")
-            print("[INFO] Local screen sharing started")
+            self.chat_widget.share_button.setEnabled(True)
         else:
-            self.overlay.show()
-            print("[INFO] Remote screen sharing started")
+            self.screen_share_active = False
+            self.other_sharing = True
+            self.chat_widget.share_button.setText("Other is Sharing")
+            self.chat_widget.share_button.setEnabled(False)
+            QMessageBox.information(self, "Screen Sharing", f"{presenter_name} started screen sharing")
 
     def on_screen_share_stop(self):
         print("[INFO] Screen share stopped")
         self.current_presenter = None
-        self.overlay.hide()
+        self.video_list_widget.remove_screen_share()
         if self.screen_share_active:
             self.client.screen_sharing = False
             self.screen_timer.stop()
             self.screen_share_active = False
-            self.chat_widget.share_button.setText("Share Screen")
-            print("[INFO] Local screen sharing stopped")
+        self.other_sharing = False
+        self.chat_widget.share_button.setText("Share Screen")
+        self.chat_widget.share_button.setEnabled(True)
+
+    def on_screen_share_reject(self):
+        self.other_sharing = True
+        self.chat_widget.share_button.setText("Other is Sharing")
+        self.chat_widget.share_button.setEnabled(False)
+        QMessageBox.warning(self, "Screen Sharing", "Screen sharing already active by another user")
 
     def on_screen_update(self, image_bytes):
-        if self.current_presenter and self.current_presenter != self.client.name:
-            self.screen_share_widget.show_share(self.current_presenter, image_bytes)
+        if self.current_presenter:
+            self.video_list_widget.add_screen_share(self.current_presenter, image_bytes)

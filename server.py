@@ -1,3 +1,4 @@
+# server.py
 import socket
 import threading
 import time
@@ -74,7 +75,7 @@ def disconnect_client(client: Client):
     print(f"[DISCONNECT] {client.name} disconnected from Main Server")
     if current_presenter == client.name:
         current_presenter = None
-        broadcast_msg(SERVER, STOP_SHARE)
+        broadcast_msg(SERVER, STOP_SHARE, SCREEN)
     client.media_addrs.update({VIDEO: None, AUDIO: None})
     client.connected = False
     broadcast_msg(client.name, RM)
@@ -90,11 +91,13 @@ def handle_main_conn(name: str):
     global current_presenter
     client: Client = clients[name]
     conn = client.main_conn
+    # Send list of existing clients to the new one
     for client_name in clients:
         if client_name == name:
             continue
         client.send_msg(client_name, ADD)
     broadcast_msg(name, ADD)
+
     while client.connected:
         msg_bytes = conn.recv_bytes()
         if not msg_bytes:
@@ -104,26 +107,40 @@ def handle_main_conn(name: str):
         except pickle.UnpicklingError:
             print(f"[{name}] [ERROR] UnpicklingError")
             continue
+
         print(msg)
+
         if msg.request == DISCONNECT:
             break
+
+        # ---------- SCREEN SHARING FIXED LOGIC ----------
         elif msg.request == START_SHARE:
             if current_presenter is None:
                 current_presenter = name
-                broadcast_msg(SERVER, START_SHARE, data=name)
+                broadcast_msg(SERVER, START_SHARE, SCREEN, data=name)
                 print(f"[SHARE] {name} started screen sharing")
             else:
                 client.send_msg(SERVER, POST, TEXT, "Screen sharing already active by another user")
+
         elif msg.request == STOP_SHARE:
             if current_presenter == name:
                 current_presenter = None
-                broadcast_msg(SERVER, STOP_SHARE)
+                broadcast_msg(SERVER, STOP_SHARE, SCREEN)
                 print(f"[SHARE] {name} stopped screen sharing")
+            else:
+                client.send_msg(SERVER, POST, TEXT, "You are not the current presenter")
+
         elif msg.request == POST and msg.data_type == SCREEN:
+            # Only presenter can broadcast screen frames
             if current_presenter == name:
-                multicast_msg(name, msg.request, None, msg.data_type, msg.data)
+                for c in clients.values():
+                    if c.name != name:  # don't send back to presenter
+                        c.send_msg(name, msg.request, msg.data_type, msg.data)
+        # ------------------------------------------------
+
         else:
             multicast_msg(name, msg.request, msg.to_names, msg.data_type, msg.data)
+
     disconnect_client(client)
 
 def main_server():
@@ -131,10 +148,13 @@ def main_server():
     main_socket.bind((IP, MAIN_PORT))
     main_socket.listen()
     print(f"[LISTENING] Main Server is listening on {IP}:{MAIN_PORT}")
+
     video_server_thread = threading.Thread(target=media_server, args=(VIDEO, VIDEO_PORT))
     video_server_thread.start()
+
     audio_server_thread = threading.Thread(target=media_server, args=(AUDIO, AUDIO_PORT))
     audio_server_thread.start()
+
     while True:
         conn, addr = main_socket.accept()
         name = conn.recv_bytes().decode()
@@ -160,3 +180,4 @@ if __name__ == "__main__":
         print(traceback.format_exc())
     finally:
         os._exit(0)
+

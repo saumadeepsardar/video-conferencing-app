@@ -1,3 +1,4 @@
+# client.py
 import os
 import time
 import sys
@@ -74,6 +75,7 @@ class ServerConnection(QThread):
     screen_share_start_signal = pyqtSignal(str)
     screen_share_stop_signal = pyqtSignal()
     screen_update_signal = pyqtSignal(bytes)
+    screen_share_reject_signal = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -216,9 +218,17 @@ class ServerConnection(QThread):
         global all_clients
         client_name = msg.from_name
         if msg.request == POST:
+            if msg.data_type == TEXT and client_name == SERVER:
+                if msg.data == "Screen sharing already active by another user":
+                    self.screen_share_reject_signal.emit()
+                    return
             if client_name not in all_clients:
-                print(f"[{self.name}] [ERROR] Invalid client name {client_name}: {msg}")
-                return
+                if msg.data_type in [VIDEO, AUDIO]:
+                    all_clients[client_name] = Client(client_name)
+                    self.add_client_signal.emit(all_clients[client_name])
+                else:
+                    print(f"[{self.name}] [ERROR] Invalid client name {client_name}: {msg}")
+                    return
             if msg.data_type == VIDEO:
                 all_clients[client_name].video_frame = msg.data
             elif msg.data_type == AUDIO:
@@ -247,11 +257,9 @@ class ServerConnection(QThread):
             else:
                 print(f"[{self.name}] [ERROR] Invalid data type {msg.data_type}")
         elif msg.request == ADD:
-            if client_name in all_clients:
-                print(f"[{self.name}] [ERROR] Client already exists with name {client_name}")
-                return
-            all_clients[client_name] = Client(client_name)
-            self.add_client_signal.emit(all_clients[client_name])
+            if client_name not in all_clients:
+                all_clients[client_name] = Client(client_name)
+                self.add_client_signal.emit(all_clients[client_name])
         elif msg.request == RM:
             if client_name not in all_clients:
                 print(f"[{self.name}] [ERROR] Invalid client name {client_name}")
