@@ -1,6 +1,7 @@
 import os
 import cv2
 import pyaudio
+import mss
 import numpy as np
 import sys
 from PyQt6.QtCore import Qt, QThread, QTimer, QSize, QRunnable, pyqtSlot, QPropertyAnimation, QEasingCurve
@@ -281,26 +282,20 @@ class Camera:
 
 class ScreenCapturer:
     def __init__(self):
-        print("[INFO] ScreenCapturer initialized with integrated capture method")
+        self.sct = mss.mss()
+        self.monitor = self.sct.monitors[1]  # main monitor
+        print("[INFO] ScreenCapturer initialized with MSS backend")
 
     def capture(self):
         try:
-            if sys.platform in ["win32", "darwin"]:
-                screenshot = ig.grab()
-            else:
-                screenshot = ig.grab(backend=bkend)
-            img = np.array(screenshot)
-            if sys.platform not in ["win32", "darwin"]:
-                img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-            else:
-                img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
-            encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), 85]
-            _, img_encoded = cv2.imencode('.jpg', img, encode_param)
-            print("[INFO] Screen captured successfully")
+            frame = np.array(self.sct.grab(self.monitor))
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGRA2BGR)
+            _, img_encoded = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
             return img_encoded.tobytes()
         except Exception as e:
-            print(f"[ERROR] Screen capture failed: {e}")
+            print(f"[ERROR] MSS screen capture failed: {e}")
             return None
+
 
 
 class VideoWidget(QWidget):
@@ -386,8 +381,19 @@ class ScreenShareWidget(QWidget):
         layout.addWidget(self.screen_viewer, 1)
         self.setLayout(layout)
 
-    def show_share(self, presenter_name, image_bytes):
+    def show_share(self, presenter_name, image_bytes, is_presenter=False):
         self.presenter_name = presenter_name
+
+        if is_presenter:
+            self.presenter_label.setText("You are now presenting your screen")
+            # Optionally show a static "presenting" preview background
+            self.screen_viewer.setText("Your screen is being shared...")
+            self.screen_viewer.setStyleSheet(
+                "color: #a6e3a1; background-color: #000000; border-radius: 12px;"
+            )
+            return
+
+        # For all other viewers
         self.presenter_label.setText(f"Screen shared by: {presenter_name}")
         if image_bytes:
             try:
@@ -398,15 +404,16 @@ class ScreenShareWidget(QWidget):
                     bytes_per_line = ch * w
                     q_img = QImage(image.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
                     pixmap = QPixmap.fromImage(q_img).scaled(
-                        self.screen_viewer.size(), Qt.AspectRatioMode.KeepAspectRatio,
+                        self.screen_viewer.size(),
+                        Qt.AspectRatioMode.KeepAspectRatio,
                         Qt.TransformationMode.SmoothTransformation
                     )
                     self.screen_viewer.setPixmap(pixmap)
                     return
             except Exception as e:
                 print(f"[ERROR] Failed to render screen share image: {e}")
-        # Fallback text if no valid frame
         self.screen_viewer.setText("Waiting for screen data...")
+
 
 
 class VideoListWidget(QListWidget):
@@ -440,12 +447,11 @@ class VideoListWidget(QListWidget):
         self.resize_widgets()
 
     
-    def add_screen_share(self, presenter_name, image_bytes):
-        # Show only one screen share panel at the bottom
+    def add_screen_share(self, presenter_name, image_bytes, is_presenter=False):
         if not self.screen_share_widget:
             self.screen_share_widget = ScreenShareWidget()
             self.parentWidget().layout().addWidget(self.screen_share_widget)
-        self.screen_share_widget.show_share(presenter_name, image_bytes)
+        self.screen_share_widget.show_share(presenter_name, image_bytes, is_presenter)
 
     def remove_screen_share(self):
         if self.screen_share_widget:
@@ -763,8 +769,8 @@ class MainWindow(QMainWindow):
             self.camera_menu.actions()[0].setIcon(QIcon('img/cam-enable.png'))
 
         # notify server/others about the new camera state
-        msg = Message(self.client.name, POST, TEXT, {"camera_enabled": self.client.camera_enabled})
-        self.server_conn.send_msg(self.server_conn.main_socket, msg)
+        #msg = Message(self.client.name, POST, TEXT, {"camera_enabled": self.client.camera_enabled})
+        #self.server_conn.send_msg(self.server_conn.main_socket, msg)
 
 
     def toggle_microphone(self):
@@ -777,8 +783,8 @@ class MainWindow(QMainWindow):
             self.microphone_menu.actions()[0].setIcon(QIcon('img/mic-enable.png'))
 
         # notify server/others about the new microphone state
-        msg = Message(self.client.name, POST, TEXT, {"microphone_enabled": self.client.microphone_enabled})
-        self.server_conn.send_msg(self.server_conn.main_socket, msg)
+        #msg = Message(self.client.name, POST, TEXT, {"microphone_enabled": self.client.microphone_enabled})
+        #self.server_conn.send_msg(self.server_conn.main_socket, msg)
 
 
     def toggle_screen_share(self):
@@ -794,10 +800,10 @@ class MainWindow(QMainWindow):
     def on_screen_share_start(self, presenter_name):
         print(f"[INFO] Screen share started by {presenter_name}")
         self.current_presenter = presenter_name
-        self.video_list_widget.add_screen_share(presenter_name, b'')
 
         if presenter_name == self.client.name:
             # You are the presenter
+            self.video_list_widget.add_screen_share(presenter_name, b'', is_presenter=True)
             self.client.screen_sharing = True
             self.screen_share_active = True
             self.screen_timer.start()
@@ -805,10 +811,12 @@ class MainWindow(QMainWindow):
             self.chat_widget.share_button.setEnabled(True)
         else:
             # Another user is sharing
+            self.video_list_widget.add_screen_share(presenter_name, b'')
             self.screen_share_active = False
             self.other_sharing = True
             self.chat_widget.share_button.setText("Other is Sharing")
             self.chat_widget.share_button.setEnabled(False)
+
 
     def on_screen_update(self, image_bytes):
         if self.current_presenter:

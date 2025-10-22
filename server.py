@@ -142,7 +142,6 @@ def handle_main_conn(name: str):
                     continue
                 # forward to everyone except the presenter
                 for c in clients.values():
-                    if c.name != name:
                         try:
                             c.send_msg(name, msg.request, msg.data_type, msg.data)
                         except Exception as e:
