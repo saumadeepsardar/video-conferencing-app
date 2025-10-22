@@ -235,8 +235,30 @@ class ServerConnection(QThread):
                 all_clients[client_name].audio_data = msg.data
             elif msg.data_type == SCREEN:
                 self.screen_update_signal.emit(msg.data)
-            elif msg.data_type == TEXT:
-                self.add_msg_signal.emit(client_name, msg.data)
+            if msg.data_type == TEXT:
+                # special status update (camera / microphone) sent as dict
+                if isinstance(msg.data, dict):
+                    status = msg.data
+                    # ensure client exists
+                    if client_name not in all_clients:
+                        all_clients[client_name] = Client(client_name)
+                        self.add_client_signal.emit(all_clients[client_name])
+                    c = all_clients[client_name]
+                    if 'camera_enabled' in status:
+                        c.camera_enabled = bool(status['camera_enabled'])
+                        # if camera is off, clear last frame
+                        if not c.camera_enabled:
+                            c.video_frame = None
+                    if 'microphone_enabled' in status:
+                        c.microphone_enabled = bool(status['microphone_enabled'])
+                        if not c.microphone_enabled:
+                            c.audio_data = None
+                    # optionally show a small system message
+                    self.add_msg_signal.emit(client_name, f"Status updated: {status}")
+                else:
+                    # legacy / regular chat text
+                    self.add_msg_signal.emit(client_name, msg.data)
+
             elif msg.data_type == FILE:
                 if type(msg.data) == str:
                     if os.path.exists(msg.data): # create copy
@@ -267,7 +289,7 @@ class ServerConnection(QThread):
             self.remove_client_signal.emit(client_name)
             all_clients.pop(client_name)
         elif msg.request == START_SHARE:
-            self.screen_share_start_signal.emit(client_name)
+            self.screen_share_start_signal.emit(msg.data)
         elif msg.request == STOP_SHARE:
             self.screen_share_stop_signal.emit()
 

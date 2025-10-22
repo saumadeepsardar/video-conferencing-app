@@ -31,10 +31,16 @@ SCREEN = 'Screen'
 
 MEDIA_SIZE = {VIDEO: 25000, AUDIO: 4500}
 
+import time
+
 def send_bytes(self, msg):
     # Prefix each message with a 4-byte length (network byte order)
-    msg = struct.pack('>I', len(msg)) + msg
-    self.sendall(msg)
+    try:
+        msg = struct.pack('>I', len(msg)) + msg
+        self.sendall(msg)
+    except Exception as e:
+        print(f"[send_bytes ERROR] {e} at {time.strftime('%H:%M:%S')}")
+        raise
 
 def recv_bytes(self):
     # Read message length and unpack it into an integer
@@ -51,13 +57,14 @@ def recvall(self, n):
     while len(data) < n:
         try:
             packet = self.recv(n - len(data))
-        except (BrokenPipeError, ConnectionResetError, OSError):
-            print(f"[ERROR] Connection not present")
+        except (BrokenPipeError, ConnectionResetError, OSError) as e:
+            print(f"[recvall ERROR] Connection not present: {e}")
             return b''
         if not packet:
             return b''
         data.extend(packet)
-    return data
+    return bytes(data)
+
 
 def disconnect(self):
     msg = Message(SERVER, DISCONNECT)

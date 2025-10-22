@@ -112,15 +112,19 @@ def handle_main_conn(name: str):
 
         if msg.request == DISCONNECT:
             break
-
-        # ---------- SCREEN SHARING FIXED LOGIC ----------
+            
         elif msg.request == START_SHARE:
             if current_presenter is None:
                 current_presenter = name
+                # send explicit start confirmation to the requester
+                clients[name].send_msg(SERVER, START_SHARE, SCREEN, data=name)
+                # broadcast to the rest that someone started sharing
                 broadcast_msg(SERVER, START_SHARE, SCREEN, data=name)
                 print(f"[SHARE] {name} started screen sharing")
             else:
-                client.send_msg(SERVER, POST, TEXT, "Screen sharing already active by another user")
+                # send rejection to requester only
+                clients[name].send_msg(SERVER, POST, TEXT, "Screen sharing already active by another user")
+
 
         elif msg.request == STOP_SHARE:
             if current_presenter == name:
@@ -129,14 +133,22 @@ def handle_main_conn(name: str):
                 print(f"[SHARE] {name} stopped screen sharing")
             else:
                 client.send_msg(SERVER, POST, TEXT, "You are not the current presenter")
-
         elif msg.request == POST and msg.data_type == SCREEN:
-            # Only presenter can broadcast screen frames
+            # Only presenter may send screen frames
+            print(name)
             if current_presenter == name:
+                if not msg.data:
+                    # skip empty frames
+                    continue
+                # forward to everyone except the presenter
                 for c in clients.values():
-                    if c.name != name:  # don't send back to presenter
-                        c.send_msg(name, msg.request, msg.data_type, msg.data)
-        # ------------------------------------------------
+                    if c.name != name:
+                        try:
+                            c.send_msg(name, msg.request, msg.data_type, msg.data)
+                        except Exception as e:
+                            print(f"[ERROR] Failed to forward screen frame to {c.name}: {e}")
+            else:
+                clients[name].send_msg(SERVER, POST, TEXT, "You are not the current presenter")
 
         else:
             multicast_msg(name, msg.request, msg.to_names, msg.data_type, msg.data)
