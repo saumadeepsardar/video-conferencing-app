@@ -4,12 +4,12 @@ import pyaudio
 import mss
 import numpy as np
 import sys
-from PyQt6.QtCore import Qt, QThread, QTimer, QSize, QRunnable, pyqtSlot, QPropertyAnimation, QEasingCurve
+from PyQt6.QtCore import Qt, QThread, QTimer, QSize, QRunnable, pyqtSlot, QPropertyAnimation, QEasingCurve, QEvent
 from PyQt6.QtGui import QImage, QPixmap, QActionGroup, QIcon, QFont, QAction
 from PyQt6.QtWidgets import QMainWindow, QVBoxLayout, QHBoxLayout, QGridLayout, QDockWidget \
     , QLabel, QWidget, QListWidget, QListWidgetItem, QMessageBox \
     , QComboBox, QTextEdit, QLineEdit, QPushButton, QFileDialog \
-    , QDialog, QMenu, QWidgetAction, QCheckBox, QStyleFactory, QGraphicsDropShadowEffect
+    , QDialog, QMenu, QWidgetAction, QCheckBox, QStyleFactory, QGraphicsDropShadowEffect, QSpacerItem, QSizePolicy
 
 from constants import *
 
@@ -357,12 +357,14 @@ class ScreenShareWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.presenter_name = ""
-        self.init_ui()
-
-    def init_ui(self):
-        # Bottom resizable panel
-        self.setMinimumHeight(200)
-        self.setStyleSheet("border-radius: 12px; background-color: #1e1e2e; border: 2px solid #45475a;")
+        self.maximized = False
+        self.original_parent = None
+        self.original_layout = None
+        self.video_list_widget = None
+        self.default_height = 300
+        self.last_image_bytes = None
+        self.setMinimumHeight(self.default_height)
+        self.setMaximumHeight(self.default_height)
 
         self.presenter_label = QLabel("Screen Share by: None")
         self.presenter_label.setStyleSheet("color: #f9e2af; font-weight: bold;")
@@ -370,31 +372,127 @@ class ScreenShareWidget(QWidget):
 
         self.screen_viewer = QLabel()
         self.screen_viewer.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.screen_viewer.setStyleSheet(
-            "border: none; background-color: #000000; border-radius: 12px;"
-        )
+        self.screen_viewer.setStyleSheet("border: none; background-color: #000; border-radius: 12px;")
 
-        layout = QVBoxLayout()
+        layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(5)
         layout.addWidget(self.presenter_label)
         layout.addWidget(self.screen_viewer, 1)
-        self.setLayout(layout)
+
+        # Floating maximize button
+        self.max_btn = QPushButton(self)
+        self.max_btn.setIcon(QIcon("img/maximise.png"))
+        self.max_btn.setIconSize(QSize(20, 20))
+        self.max_btn.setFixedSize(32, 32)
+        self.max_btn.setToolTip("Maximize screen share")
+        self.max_btn.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(255,255,255,0.2);
+                border-radius: 10px;
+                border: none;
+            }
+            QPushButton:hover { background-color: rgba(255,255,255,0.4); }
+        """)
+        self.max_btn.setFlat(True)
+        self.max_btn.clicked.connect(self.toggle_maximize)
+
+        # Position button at top-right corner
+        self.max_btn.raise_()
+        self.max_btn.move(self.width() - 45, 10)
+
+    def resizeEvent(self, event):
+        # Reposition floating button on resize
+        self.max_btn.move(self.width() - 45, 10)
+        super().resizeEvent(event)
+
+    def toggle_maximize(self):
+        """Toggle maximize/restore for screen share panel"""
+        main_window = self.window()
+        central_widget = main_window.centralWidget()
+        central_layout = central_widget.layout()
+
+        if not self.maximized:
+            # Save references
+            self.original_parent = self.parent()
+            self.original_layout = self.original_parent.layout() if self.original_parent else None
+            if self.original_layout:
+                self.original_layout.removeWidget(self)
+
+            # Hide sidebar to cover its area
+            self.sidebar = next((d for d in main_window.findChildren(QDockWidget) if d.windowTitle() == "Chat"), None)
+            if self.sidebar:
+                self.sidebar.hide()
+
+            # Remove video_list from layout to free space
+            video_item = central_layout.takeAt(0)
+            if video_item:
+                self.video_list_widget = video_item.widget()
+
+            # Remove size constraints to allow full expansion
+            self.setMinimumHeight(0)
+            self.setMaximumHeight(16777215)
+
+            # Re-add to central layout at the end to keep "bottom" positioning
+            central_layout.addWidget(self)
+            self.show()
+
+            # Hide label for full coverage
+            self.presenter_label.hide()
+
+            # Update button
+            self.max_btn.setIcon(QIcon("img/restore.png"))
+            self.max_btn.setToolTip("Restore screen share")
+
+            self.maximized = True
+            self.update()
+
+            # Refresh the image if available
+            if self.last_image_bytes:
+                self.show_share(self.presenter_name, self.last_image_bytes, is_presenter=False)
+        else:
+            # Restore: re-add video_list and show sidebar
+            central_layout.removeWidget(self)
+
+            if self.video_list_widget:
+                central_layout.insertWidget(0, self.video_list_widget)
+                self.video_list_widget = None
+
+            if self.sidebar:
+                self.sidebar.show()
+                self.sidebar = None
+
+            # Restore size constraints
+            self.setMinimumHeight(self.default_height)
+            self.setMaximumHeight(self.default_height)
+
+            # Show label
+            self.presenter_label.show()
+
+            # Re-add to original layout if exists
+            if self.original_layout:
+                self.original_layout.addWidget(self)
+
+            # Update button
+            self.max_btn.setIcon(QIcon("img/maximise.png"))
+            self.max_btn.setToolTip("Maximize screen share")
+
+            self.maximized = False
+            self.show()
+            self.update()
 
     def show_share(self, presenter_name, image_bytes, is_presenter=False):
         self.presenter_name = presenter_name
 
         if is_presenter:
             self.presenter_label.setText("You are now presenting your screen")
-            # Optionally show a static "presenting" preview background
             self.screen_viewer.setText("Your screen is being shared...")
-            self.screen_viewer.setStyleSheet(
-                "color: #a6e3a1; background-color: #000000; border-radius: 12px;"
-            )
+            self.screen_viewer.setStyleSheet("color: #a6e3a1; background-color: #000; border-radius: 12px;")
+            self.max_btn.hide()
             return
 
-        # For all other viewers
+        self.max_btn.show()
         self.presenter_label.setText(f"Screen shared by: {presenter_name}")
+
         if image_bytes:
             try:
                 image = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_COLOR)
@@ -403,18 +501,23 @@ class ScreenShareWidget(QWidget):
                     h, w, ch = image.shape
                     bytes_per_line = ch * w
                     q_img = QImage(image.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
-                    pixmap = QPixmap.fromImage(q_img).scaled(
-                        self.screen_viewer.size(),
+                    pixmap = QPixmap.fromImage(q_img)
+
+                    # Scale to screen viewer size
+                    target_size = self.screen_viewer.size()
+                    pixmap = pixmap.scaled(
+                        target_size,
                         Qt.AspectRatioMode.KeepAspectRatio,
                         Qt.TransformationMode.SmoothTransformation
                     )
                     self.screen_viewer.setPixmap(pixmap)
+                    self.last_image_bytes = image_bytes
                     return
             except Exception as e:
                 print(f"[ERROR] Failed to render screen share image: {e}")
+
         self.screen_viewer.setText("Waiting for screen data...")
-
-
+        self.last_image_bytes = None
 
 class VideoListWidget(QListWidget):
     def __init__(self, parent=None):
@@ -490,12 +593,71 @@ class VideoListWidget(QListWidget):
         self.all_items.pop(name)
         self.resize_widgets()
 
+class FileTransferItem(QWidget):
+    def __init__(self, filename: str, total: int, parent=None):
+        super().__init__(parent)
+        self.total = total
+        self.received = 0
 
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 2, 0, 2)
+
+        self.label = QLabel(f"{filename} (0 / {self._human(total)})")
+        self.progress = QProgressBar()
+        self.progress.setRange(0, 100)
+        self.progress.setTextVisible(False)
+        self.progress.setFixedHeight(6)
+        self.progress.setStyleSheet("""
+            QProgressBar { border: none; background: #313244; border-radius: 3px; }
+            QProgressBar::chunk { background: #a6e3a1; border-radius: 3px; }
+        """)
+
+        self.save_btn = QPushButton("Save…")
+        self.save_btn.setFixedWidth(70)
+        self.save_btn.clicked.connect(self._save_file)
+        self.save_btn.setEnabled(False)
+
+        layout.addWidget(self.label, 1)
+        layout.addWidget(self.progress)
+        layout.addWidget(self.save_btn)
+
+        self._buffer = bytearray()
+
+    def _human(self, bytes_: int) -> str:
+        for unit in ['B', 'KB', 'MB', 'GB']:
+            if bytes_ < 1024:
+                return f"{bytes_:.1f}{unit}"
+            bytes_ /= 1024
+        return f"{bytes_:.1f}TB"
+
+    def append_data(self, chunk: bytes):
+        self._buffer.extend(chunk)
+        self.received = len(self._buffer)
+        percent = int(self.received * 100 / self.total)
+        self.progress.setValue(percent)
+        self.label.setText(f"{os.path.basename(self.label.text().split(' (')[0])} "
+                           f"({self._human(self.received)} / {self._human(self.total)})")
+
+        if self.received >= self.total:
+            self.save_btn.setEnabled(True)
+
+    def _save_file(self):
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save file", os.path.basename(self.label.text().split(' (')[0]))
+        if path:
+            with open(path, "wb") as f:
+                f.write(self._buffer)
+            QMessageBox.information(self, "Saved", f"File saved to:\n{path}")
+            self.save_btn.setEnabled(False)
+            self.save_btn.setText("Saved")
+            
+            
 class ChatWidget(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.clients_checkboxes = {}
         self.clients_menu_actions = {}
+        self.transfer_widgets: dict[str, FileTransferItem] = {}
         self.init_ui()
 
     def init_ui(self):
@@ -533,6 +695,40 @@ class ChatWidget(QWidget):
         self.end_button = QPushButton("End Call", self)
         self.end_button.setStyleSheet("background-color: #f38ba8; color: #1e1e2e;")
         self.layout.addWidget(self.end_button)
+        
+        self.transfer_area = QVBoxLayout()
+        self.transfer_area.setSpacing(4)
+        self.layout.insertLayout(3, self.transfer_area)
+        
+    def start_file_transfer(self, transfer_id: str, filename: str, total: int, from_name: str):
+        """Called when a file starts arriving."""
+        item = FileTransferItem(filename, total, self)
+        self.transfer_area.addWidget(item)
+        self.transfer_widgets[transfer_id] = item
+
+        # also show a system line in the chat log
+        self.central_widget.append(f"[{from_name}] → File: {filename} ({self._human(total)})")
+
+    def update_file_transfer(self, transfer_id: str, chunk: bytes):
+        """Append a chunk to an in-progress transfer."""
+        if transfer_id in self.transfer_widgets:
+            self.transfer_widgets[transfer_id].append_data(chunk)
+
+    def finish_file_transfer(self, transfer_id: str):
+        """Optional – called when server says transfer is done."""
+        if transfer_id not in self.transfer_widgets:
+            return
+        widget = self.transfer_widgets[transfer_id]
+        widget.progress.setValue(100)
+        widget.save_btn.setEnabled(True)
+        # keep the widget for a while so user can still click “Save…”
+    
+    def _human(self, b: int) -> str:
+        for unit in ['B', 'KB', 'MB', 'GB']:
+            if b < 1024:
+                return f"{b:.1f}{unit}"
+            b /= 1024
+        return f"{b:.1f}TB"
 
     def add_client(self, name: str):
         if name in self.clients_checkboxes:
@@ -705,24 +901,25 @@ class MainWindow(QMainWindow):
     
     def add_client(self, client):
         self.video_list_widget.add_client(client)
-        self.layout_actions[LAYOUT_RES].setChecked(True)
         if ENABLE_AUDIO:
             self.audio_threads[client.name] = AudioThread(client, self)
             self.audio_threads[client.name].start()
         if not client.current_device:
             self.chat_widget.add_client(client.name)
-    
+        # --- new join message ---
+        join_msg = f"🟢 {client.name} joined the chat"
+        self.chat_widget.add_msg("System", "All", join_msg)
+
     def remove_client(self, name: str):
         self.video_list_widget.remove_client(name)
-        self.layout_actions[LAYOUT_RES].setChecked(True)
         if ENABLE_AUDIO and name in self.audio_threads:
             self.audio_threads[name].connected = False
             self.audio_threads[name].wait()
             self.audio_threads.pop(name)
-            print(f"Audio Thread for {name} terminated")
-        print(f"removing {name} chat...")
         self.chat_widget.remove_client(name)
-        print(f"{name} removed")
+        # --- new leave message ---
+        leave_msg = f"🔴 {name} left the chat"
+        self.chat_widget.add_msg("System", "All", leave_msg)
 
     def send_msg(self, data_type: str = TEXT):
         selected = self.chat_widget.selected_clients()
@@ -769,8 +966,8 @@ class MainWindow(QMainWindow):
             self.camera_menu.actions()[0].setIcon(QIcon('img/cam-enable.png'))
 
         # notify server/others about the new camera state
-        #msg = Message(self.client.name, POST, TEXT, {"camera_enabled": self.client.camera_enabled})
-        #self.server_conn.send_msg(self.server_conn.main_socket, msg)
+        msg = Message(self.client.name, POST, TEXT, {"camera_enabled": self.client.camera_enabled})
+        self.server_conn.send_msg(self.server_conn.main_socket, msg)
 
 
     def toggle_microphone(self):
@@ -783,8 +980,8 @@ class MainWindow(QMainWindow):
             self.microphone_menu.actions()[0].setIcon(QIcon('img/mic-enable.png'))
 
         # notify server/others about the new microphone state
-        #msg = Message(self.client.name, POST, TEXT, {"microphone_enabled": self.client.microphone_enabled})
-        #self.server_conn.send_msg(self.server_conn.main_socket, msg)
+        msg = Message(self.client.name, POST, TEXT, {"microphone_enabled": self.client.microphone_enabled})
+        self.server_conn.send_msg(self.server_conn.main_socket, msg)
 
 
     def toggle_screen_share(self):
