@@ -763,46 +763,102 @@ class ChatWidget(QWidget):
     # === File Download UI Methods ===
     def populate_download_menu(self, files_list):
         """
-        Populates the dropdown (combo box) with files available for this client.
-        Each combo entry stores the server-provided metadata dict as userData.
-        Expected server entry format: { "transfer_id", "filename", "size", "from", "timestamp" }
+        Populates the QMenu dropdown attached to the Download button.
+        Each QAction in the menu represents one available file and stores metadata in .data().
+        Expected entry format: {"transfer_id","filename","size","from","timestamp"}.
         """
         try:
-            if not hasattr(self, "download_menu"):
-                from PyQt6.QtWidgets import QComboBox, QPushButton, QHBoxLayout, QProgressBar
+            # Ensure we have a proper QMenu
+            if not hasattr(self, "download_menu") or not isinstance(self.download_menu, QMenu):
+                self.download_menu = QMenu(self)
+                self.download_button.setMenu(self.download_menu)
 
-                # Create UI elements dynamically if not present
-                self.download_menu = QComboBox()
-                self.download_menu.setMinimumWidth(200)
-                self.download_button = QPushButton("Download")
-                self.download_progress = QProgressBar()
-                self.download_progress.setValue(0)
-                self.download_progress.setVisible(False)
-
-                hl = QHBoxLayout()
-                hl.addWidget(self.download_menu)
-                hl.addWidget(self.download_button)
-                hl.addWidget(self.download_progress)
-                # prefer to add this to the same line layout the UI used earlier
-                try:
-                    self.line_layout.addLayout(hl)
-                except Exception:
-                    self.layout().addLayout(hl)
-
-                # Connect the button to trigger download
-                self.download_button.clicked.connect(self._start_file_download)
-
-            # Fill menu: clear and add items storing the dict as data
             self.download_menu.clear()
+
+            if not files_list:
+                empty_action = self.download_menu.addAction("(No files available)")
+                empty_action.setEnabled(False)
+                return
+
+            unique = {}
             for entry in files_list:
-                if isinstance(entry, dict):
-                    label = f"{entry.get('filename','<unknown>')} — from {entry.get('from','')}"
-                    self.download_menu.addItem(label, entry)
-                else:
-                    # fallback for legacy strings
-                    self.download_menu.addItem(str(entry), None)
+                if not isinstance(entry, dict):
+                    continue
+                tid = entry.get("transfer_id")
+                if not tid or tid in unique:
+                    continue
+                unique[tid] = True
+
+                filename = entry.get("filename", "<unknown>")
+                sender = entry.get("from", "")
+                size = entry.get("size", 0)
+                size_kb = f"{size/1024:.1f} KB"
+                label = f"{filename} ({size_kb}) — from {sender}"
+
+                act = self.download_menu.addAction(label)
+                act.setData(entry)
+                act.triggered.connect(lambda checked=False, a=act: self._download_action_triggered(a))
+            print(f"[ChatWidget] populate_download_menu: {len(files_list)} items")
+
         except Exception as e:
             print("[ChatWidget] populate_download_menu ERROR:", e)
+
+    def _download_action_triggered(self, action):
+        """Called when a file is selected from the download dropdown."""
+        entry = action.data()
+        if not entry:
+            return
+        transfer_id = entry.get("transfer_id")
+        filename = entry.get("filename")
+        size = entry.get("size", 0)
+
+        try:
+            parent = self.window()
+            if hasattr(parent, 'server_conn') and parent.server_conn is not None:
+                parent.server_conn.request_download(transfer_id)
+                self.start_file_transfer(transfer_id, filename, size, entry.get("from", ""))
+        except Exception as e:
+            print(f"[ERROR] download request failed: {e}")
+
+    def start_file_transfer(self, transfer_id: str, filename: str, total: int, from_name: str):
+        """Called when a file starts arriving."""
+        item = FileTransferItem(filename, total, self)
+        self.transfer_area.addWidget(item)
+        self.transfer_widgets[transfer_id] = item
+        self.central_widget.append(f"[{from_name}] → File: {filename} ({self._human(total)})")
+
+    def update_file_transfer(self, transfer_id: str, chunk: bytes):
+        """Append a chunk to an in-progress transfer."""
+        if transfer_id in self.transfer_widgets:
+            self.transfer_widgets[transfer_id].append_data(chunk)
+
+    def finish_file_transfer(self, transfer_id: str):
+        """Called when server signals file download finished."""
+        if transfer_id not in self.transfer_widgets:
+            return
+        widget = self.transfer_widgets[transfer_id]
+        widget.progress.setValue(100)
+        widget.save_btn.setEnabled(True)
+
+    def update_download_progress(self, percent):
+        """Optional download progress update (if server supports percent updates)."""
+        try:
+            if hasattr(self, "download_progress"):
+                self.download_progress.setVisible(True)
+                self.download_progress.setValue(int(percent))
+        except Exception as e:
+            print("[ChatWidget] update_download_progress ERROR:", e)
+
+    def download_complete(self, filename):
+        """Called when file download finishes."""
+        try:
+            if hasattr(self, "download_progress"):
+                self.download_progress.setValue(100)
+                self.download_progress.setVisible(False)
+            self.add_message(f"Download complete: {filename}")
+        except Exception as e:
+            print("[ChatWidget] download_complete ERROR:", e)
+    # === End File Download UI Methods ===
 
 
 
@@ -913,27 +969,33 @@ class ChatWidget(QWidget):
         widget.save_btn.setEnabled(True)
         # keep the widget for a while so user can still click “Save…”
         
-            # Called for outgoing uploads (sender UI)
     def start_upload_transfer(self, upload_id: str, filename: str, total: int, to_names: tuple):
         """Create an upload progress widget for an outgoing file."""
         label_to = ", ".join(to_names) if isinstance(to_names, (list, tuple)) else str(to_names)
         item = FileTransferItem(filename, total, self)
-        # tweak label to show "Uploading to X"
+        item.total_bytes = total  # store for progress calculations
         item.label.setText(f"Uploading to {label_to}: {filename} (0 / {self._human(total)})")
         self.transfer_area.addWidget(item)
         self.transfer_widgets[upload_id] = item
 
+
     def update_upload_progress(self, upload_id: str, percent: int):
-        """Update outgoing upload progress widget by percent."""
+        """Update outgoing upload progress widget by percent and bytes."""
         if upload_id in self.transfer_widgets:
             widget = self.transfer_widgets[upload_id]
             try:
                 widget.progress.setValue(int(percent))
-                # also update text percentage (keep bytes text for incoming)
-                base_filename = os.path.basename(widget.label.text().split(':')[-1].strip().split(' (')[0])
-                widget.label.setText(f"{widget.label.text().split(':')[0]}: {base_filename} ({percent}%)")
-            except Exception:
-                pass
+                if hasattr(widget, "total_bytes"):
+                    sent_bytes = int((percent / 100) * widget.total_bytes)
+                    label_prefix = widget.label.text().split('(')[0].strip()
+                    widget.label.setText(f"{label_prefix} ({self._human(sent_bytes)} / {self._human(widget.total_bytes)})")
+                else:
+                    # fallback if total not stored
+                    label_prefix = widget.label.text().split('(')[0].strip()
+                    widget.label.setText(f"{label_prefix} ({percent}%)")
+            except Exception as e:
+                print(f"[UI] update_upload_progress ERROR: {e}")
+
 
     def finish_upload_transfer(self, upload_id: str):
         """Mark outgoing upload complete."""

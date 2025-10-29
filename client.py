@@ -176,69 +176,57 @@ class ServerConnection(QThread):
             self.connected = False
     
     def send_file(self, filepath: str, to_names: tuple[str]):
-        """Send a file to server (server will store and make available to recipients).
-           Allows screen sharing to continue smoothly by throttling send speed slightly."""
+        """Send a file to server (server stores and makes available to recipients)"""
         import time
-        filename = os.path.basename(filepath)
-        filesize = os.path.getsize(filepath) if os.path.exists(filepath) else 0
+        if not os.path.exists(filepath):
+            self.add_msg_signal.emit(self.name, f"File not found: {filepath}")
+            return
 
-        # generate a local upload id (client-side only) so the UI can display progress
+        filename = os.path.basename(filepath)
+        filesize = os.path.getsize(filepath)
         upload_id = f"upload_{filename}_{int(time.time()*1000)}"
 
-        # Notify server about the filename (start of transfer)
+        # Notify server of filename start
         self.send_msg(self.main_socket, Message(self.name, POST, FILE, filename, to_names))
-
-        # Emit start_upload_signal so sender UI creates an outgoing progress widget
         try:
             self.start_upload_signal.emit(upload_id, filename, filesize, to_names)
         except Exception:
             pass
 
         total_sent = 0
-        last_percent_emitted = -1
+        last_percent = -1
 
         try:
-            with open(filepath, 'rb') as f:
+            with open(filepath, "rb") as f:
                 while True:
-                    data = f.read(SIZE - 1024)  # use slightly smaller chunks
+                    data = f.read(SIZE)
                     if not data:
                         break
 
                     msg = Message(self.name, POST, FILE, data, to_names)
                     self.send_msg(self.main_socket, msg)
+
                     total_sent += len(data)
-
-                    # yield briefly to avoid starving screen-share thread
-                    time.sleep(0.002)
-
-                    # compute percent and emit progress updates
                     percent = int((total_sent * 100) / (filesize or 1))
-                    if percent != last_percent_emitted:
-                        try:
-                            self.upload_progress_signal.emit(upload_id, percent)
-                        except Exception:
-                            pass
-                        last_percent_emitted = percent
+                    if percent != last_percent:
+                        self.upload_progress_signal.emit(upload_id, percent)
+                        last_percent = percent
 
-            # send end marker
+                    time.sleep(0.001)  # Prevent flooding
+
+            # Send end marker
             self.send_msg(self.main_socket, Message(self.name, POST, FILE, None, to_names))
 
-            # notify finish
-            try:
-                self.finish_upload_signal.emit(upload_id)
-            except Exception:
-                pass
-
-            # Optional confirmation in chat
-            self.add_msg_signal.emit(self.name, f"File {filename} uploaded successfully.")
+            self.finish_upload_signal.emit(upload_id)
+            self.add_msg_signal.emit(self.name, f"File '{filename}' uploaded successfully ({filesize} bytes).")
 
         except Exception as e:
-            # handle error
-            self.add_msg_signal.emit(self.name, f"Error sending file: {e}")
+            self.add_msg_signal.emit(self.name, f"[ERROR] Upload failed: {e}")
             try:
                 self.finish_upload_signal.emit(upload_id)
             except Exception:
                 pass
+
 
 
 
@@ -372,36 +360,32 @@ class ServerConnection(QThread):
             # forward to UI
             self.files_list_signal.emit(file_list)
 
-        # NEW: server streams file chunks using FILE_CHUNK / FILE with different payloads
         elif msg.request == FILE_CHUNK and msg.data_type == FILE:
-            # msg.data may be:
-            #  - dict metadata: {"transfer_id","filename","size","from"}
-            #  - bytes chunk
-            #  - None == end of stream
-            if isinstance(msg.data, dict):
-                meta = msg.data
-                transfer_id = meta.get("transfer_id")
-                filename = meta.get("filename")
-                size = meta.get("size", 0)
-                from_name = meta.get("from", "")
-                # notify UI to create a download widget
-                self.start_download_signal.emit(transfer_id, filename, size, from_name)
-            elif msg.data is None:
-                # finish
-                # we don't have a transfer id in this message; but start_download_signal used by UI to
-                # map future chunk events. To correlate, chunks are accompanied by start signal first.
-                # We'll send a generic finish signal (UI should map by last active transfer).
-                # To be robust, client GUI should track transfer ids it started and match finish order.
-                # Here we just emit finish without id (UI will handle per-implementation).
-                # But better: the server streams only to the requester, so UI can assume the single active incoming.
-                # We'll emit finish_download_signal with an empty transfer id (UI should adapt).
-                self.finish_download_signal.emit("")
-            else:
-                # bytes chunk — we need transfer id, but server does not include it in chunk messages to save space.
-                # To be robust, server could have sent transfer_id with every chunk; if not, we emit chunk with empty id.
-                # For simplicity, we emit chunk with empty id; GUI should use the last started transfer id.
-                chunk = msg.data
-                self.download_chunk_signal.emit("", chunk)
+                # Track current active transfer id across chunk stream
+                if not hasattr(self, "_current_download_id"):
+                    self._current_download_id = None
+
+                if isinstance(msg.data, dict):
+                    # Start of new file stream
+                    meta = msg.data
+                    transfer_id = meta.get("transfer_id")
+                    filename = meta.get("filename")
+                    size = meta.get("size", 0)
+                    from_name = meta.get("from", "")
+                    self._current_download_id = transfer_id
+                    self.start_download_signal.emit(transfer_id, filename, size, from_name)
+
+                elif msg.data is None:
+                    # End of file stream
+                    if self._current_download_id:
+                        self.finish_download_signal.emit(self._current_download_id)
+                    self._current_download_id = None
+
+                else:
+                    # File data chunk
+                    if getattr(self, "_current_download_id", None):
+                        self.download_chunk_signal.emit(self._current_download_id, msg.data)
+
 
         elif msg.request == GET_FILES:
             # not expected from server to client

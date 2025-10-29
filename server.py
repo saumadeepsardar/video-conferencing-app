@@ -172,11 +172,21 @@ def handle_file_post(msg: Message, from_name: str):
                 path = info["path"]
                 fobj.close()
                 size = os.path.getsize(path)
-                ensure_files_index_for(r)
-                for entry in files_index[r]:
-                    if entry["transfer_id"] == transfer_key[2] and entry["filename"] == info["filename"]:
-                        entry["size"] = size
-                        break
+                if size > 0:
+                    ensure_files_index_for(r)
+                    # update or replace any placeholder 0-byte entry
+                    updated = False
+                    for entry in files_index[r]:
+                        if entry["transfer_id"] == transfer_key[2] and entry["filename"] == info["filename"]:
+                            entry["size"] = size
+                            updated = True
+                            break
+                    if not updated:
+                        add_file_index(r, info["filename"], path, size, from_name, transfer_key[2])
+                else:
+                    print(f"[WARN] Skipping empty file {path} (0 bytes)")
+                    os.remove(path)
+
             except Exception as e:
                 print(f"[ERROR] Closing file for {r}: {e}")
 
