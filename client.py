@@ -83,6 +83,13 @@ class ServerConnection(QThread):
     download_chunk_signal = pyqtSignal(str, bytes)  # transfer_id, chunk
     finish_download_signal = pyqtSignal(str)  # transfer_id
 
+    # --- NEW: upload signals for sender-side UI ---
+    start_upload_signal = pyqtSignal(str, str, int, tuple)   # upload_id, filename, total_bytes, to_names
+    upload_progress_signal = pyqtSignal(str, int)           # upload_id, percent (0-100)
+    finish_upload_signal = pyqtSignal(str)                  # upload_id
+# --------------------------------------------------------------------
+
+    
     def __init__(self, parent=None):
         super().__init__(parent)
         self.threadpool = None
@@ -170,33 +177,70 @@ class ServerConnection(QThread):
     
     def send_file(self, filepath: str, to_names: tuple[str]):
         """Send a file to server (server will store and make available to recipients).
-           This runs in a Worker thread."""
+           Allows screen sharing to continue smoothly by throttling send speed slightly."""
+        import time
         filename = os.path.basename(filepath)
         filesize = os.path.getsize(filepath) if os.path.exists(filepath) else 0
-        # First notify server about the filename (start of transfer)
+
+        # generate a local upload id (client-side only) so the UI can display progress
+        upload_id = f"upload_{filename}_{int(time.time()*1000)}"
+
+        # Notify server about the filename (start of transfer)
         self.send_msg(self.main_socket, Message(self.name, POST, FILE, filename, to_names))
-        # For UI: start an upload progress indicator (we emit textual messages; GUI may show a progress bar)
+
+        # Emit start_upload_signal so sender UI creates an outgoing progress widget
+        try:
+            self.start_upload_signal.emit(upload_id, filename, filesize, to_names)
+        except Exception:
+            pass
+
         total_sent = 0
-        last_emit = 0
+        last_percent_emitted = -1
+
         try:
             with open(filepath, 'rb') as f:
-                data = f.read(SIZE)
-                while data:
+                while True:
+                    data = f.read(SIZE - 1024)  # use slightly smaller chunks
+                    if not data:
+                        break
+
                     msg = Message(self.name, POST, FILE, data, to_names)
                     self.send_msg(self.main_socket, msg)
                     total_sent += len(data)
-                    # emit simple progress messages for sender UI
-                    percent = int(total_sent * 100 / (filesize or 1))
-                    if percent != last_emit and percent % 5 == 0:
-                        # send a short status message to UI via add_msg_signal (you'll see "Uploading X%")
-                        self.add_msg_signal.emit(self.name, f"Uploading {filename}: {percent}%")
-                        last_emit = percent
-                    data = f.read(SIZE)
-                # final None to indicate EOF
-                self.send_msg(self.main_socket, Message(self.name, POST, FILE, None, to_names))
-            self.add_msg_signal.emit(self.name, f"File {filename} sent to server.")
+
+                    # yield briefly to avoid starving screen-share thread
+                    time.sleep(0.002)
+
+                    # compute percent and emit progress updates
+                    percent = int((total_sent * 100) / (filesize or 1))
+                    if percent != last_percent_emitted:
+                        try:
+                            self.upload_progress_signal.emit(upload_id, percent)
+                        except Exception:
+                            pass
+                        last_percent_emitted = percent
+
+            # send end marker
+            self.send_msg(self.main_socket, Message(self.name, POST, FILE, None, to_names))
+
+            # notify finish
+            try:
+                self.finish_upload_signal.emit(upload_id)
+            except Exception:
+                pass
+
+            # Optional confirmation in chat
+            self.add_msg_signal.emit(self.name, f"File {filename} uploaded successfully.")
+
         except Exception as e:
+            # handle error
             self.add_msg_signal.emit(self.name, f"Error sending file: {e}")
+            try:
+                self.finish_upload_signal.emit(upload_id)
+            except Exception:
+                pass
+
+
 
     def request_file_list(self):
         """Ask server for files available for this client"""
@@ -294,26 +338,11 @@ class ServerConnection(QThread):
                     # legacy / regular chat text
                     self.add_msg_signal.emit(client_name, msg.data)
 
-            elif msg.data_type == FILE:
-                # existing behavior: previous peer-to-peer file sending (deprecated)
-                # But server-side file transport uses FILE_LIST / FILE_CHUNK message types.
-                # Keep backward compatibility for incoming direct file pushes:
-                if type(msg.data) == str:
-                    if os.path.exists(msg.data): # create copy
-                        filename, ext = os.path.splitext(msg.data)
-                        i = 1
-                        while os.path.exists(f"{filename}({i}){ext}"):
-                            i += 1
-                        msg.data = f"{filename}({i}){ext}"
-                    self.recieving_filename = msg.data
-                    with open(self.recieving_filename, 'wb') as f:
-                        pass
-                elif msg.data is None:
-                    self.add_msg_signal.emit(client_name, f"File {self.recieving_filename} recieved.")
-                    self.recieving_filename = None
-                else:
-                    with open(self.recieving_filename, 'ab') as f:
-                        f.write(msg.data)
+            elif msg.data_type == FILE and msg.request == POST:
+                # Deprecated: peer-to-peer direct file sending.
+                # Skip to avoid duplicate empty file creation.
+                return
+
             else:
                 # Unknown data_type for POST
                 pass

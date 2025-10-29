@@ -109,24 +109,26 @@ def add_file_index(recipient: str, filename: str, path: str, size: int, from_nam
 
 def handle_file_post(msg: Message, from_name: str):
     """
+    Handles incoming file POST messages.
     msg.data semantics:
-      - If str: this is the start-of-transfer announcement (filename string)
-      - If bytes: chunk to be appended
-      - If None: end-of-transfer marker
+      - str  : start-of-transfer (filename)
+      - bytes: file data chunk
+      - None : end-of-transfer marker
     msg.to_names: recipients tuple
     """
     global active_transfers
+
+    # determine intended recipients
     if not msg.to_names:
-        # treat as broadcast to all clients (store for all)
-        recipients = [name for name in clients.keys() if name != from_name]
+        recipients = [n for n in clients.keys() if n != from_name]
     else:
         recipients = [n for n in msg.to_names if n in clients]
 
+    # --- CASE 1: start-of-transfer (filename string) ---
     if isinstance(msg.data, str):
-        # start-of-transfer (filename)
         filename = os.path.basename(msg.data)
-        transfer_id = f"{from_name}_{filename}_{int(time.time()*1000)}"
-        # create per-recipient files and open handles
+        transfer_id = f"{from_name}_{filename}_{int(time.time() * 1000)}"
+
         handles = {}
         for r in recipients:
             rdir = os.path.join(DATA_DIR, r)
@@ -134,67 +136,70 @@ def handle_file_post(msg: Message, from_name: str):
             safe_name = safe_filename(rdir, filename)
             path = os.path.join(rdir, safe_name)
             try:
-                fobj = open(path, 'wb')
+                fobj = open(path, "wb")
             except Exception as e:
-                print(f"[ERROR] Failed to open file for writing {path}: {e}")
+                print(f"[ERROR] Could not open {path} for writing: {e}")
                 continue
             handles[r] = {"fileobj": fobj, "path": path, "filename": safe_name}
-            # add a preliminary index entry (size 0 for now) so it appears in lists quickly
+            # add preliminary index entry so file appears early in recipient's list
             add_file_index(r, safe_name, path, 0, from_name, transfer_id)
-        # store in active_transfers keyed by (from_name, filename, transfer_id)
+
+        # register this active transfer
         active_transfers[(from_name, filename, transfer_id)] = handles
         print(f"[FILE] Starting transfer {transfer_id} from {from_name} -> {recipients}")
         return
 
-    # find which active transfer this chunk belongs to
-    # We will search active_transfers keys by matching from_name and one filename that matches
-    matched_keys = [k for k in active_transfers.keys() if k[0] == from_name]
-    if not matched_keys:
-        print(f"[WARN] Received file chunk but no active transfer from {from_name}")
+    # --- CASE 2: safety guard: ignore stray chunks if no transfer started yet ---
+    if not active_transfers:
+        print(f"[WARN] No active transfer yet for {from_name}, ignoring stray data")
         return
 
-    # We treat chunk messages as applying to the most recent transfer from this sender
-    # (since client sends start filename first, then chunks, then None end marker)
-    matched_keys.sort(key=lambda k: k[2], reverse=True)  # newest first
+    # --- locate active transfer for this sender ---
+    matched_keys = [k for k in active_transfers.keys() if k[0] == from_name]
+    if not matched_keys:
+        print(f"[WARN] Received file data but no matching active transfer from {from_name}")
+        return
+
+    matched_keys.sort(key=lambda k: k[2], reverse=True)  # pick newest
     transfer_key = matched_keys[0]
     handles = active_transfers.get(transfer_key)
 
+    # --- CASE 3: end-of-transfer marker ---
     if msg.data is None:
-        # End of transfer: close all handles and update sizes
         for r, info in list(handles.items()):
             try:
                 fobj = info["fileobj"]
                 path = info["path"]
                 fobj.close()
                 size = os.path.getsize(path)
-                # update index entry for this recipient and transfer_id
                 ensure_files_index_for(r)
-                # find entry by transfer_id and filename (path)
                 for entry in files_index[r]:
                     if entry["transfer_id"] == transfer_key[2] and entry["filename"] == info["filename"]:
                         entry["size"] = size
                         break
             except Exception as e:
                 print(f"[ERROR] Closing file for {r}: {e}")
-        # remove active transfer entry
+
         try:
             del active_transfers[transfer_key]
         except KeyError:
             pass
+
         print(f"[FILE] Completed transfer {transfer_key[2]} from {from_name}")
-        # optionally, notify recipients that files are available (could be done on GET_FILES request)
         return
 
-    # it's a bytes chunk: write to each recipient's file
+    # --- CASE 4: file data chunk (bytes) ---
     if isinstance(msg.data, (bytes, bytearray)):
         for r, info in handles.items():
             try:
-                fobj = info["fileobj"]
-                fobj.write(msg.data)
+                info["fileobj"].write(msg.data)
             except Exception as e:
                 print(f"[ERROR] Writing chunk for {r}: {e}")
-    else:
-        print(f"[WARN] Unexpected file data type from {from_name}: {type(msg.data)}")
+        return
+
+    # --- fallback: unexpected type ---
+    print(f"[WARN] Unexpected file data type from {from_name}: {type(msg.data)}")
+
 
 def send_file_list_to(client_name: str):
     """

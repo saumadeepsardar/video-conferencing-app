@@ -614,9 +614,24 @@ class FileTransferItem(QWidget):
         """)
 
         self.save_btn = QPushButton("Save…")
-        self.save_btn.setFixedWidth(70)
+        self.save_btn.setMinimumWidth(100)
+        self.save_btn.setFixedHeight(28)
+        self.save_btn.setStyleSheet("""
+            QPushButton {
+                background-color: #89b4fa;
+                color: #1e1e2e;
+                border-radius: 6px;
+                padding: 4px 10px;
+                font-weight: bold;
+            }
+            QPushButton:disabled {
+                background-color: #a6adc8;
+                color: #1e1e2e;
+            }
+        """)
         self.save_btn.clicked.connect(self._save_file)
         self.save_btn.setEnabled(False)
+
 
         layout.addWidget(self.label, 1)
         layout.addWidget(self.progress)
@@ -700,14 +715,29 @@ class ChatWidget(QWidget):
         self.transfer_area = QVBoxLayout()
         self.transfer_area.setSpacing(4)
         self.layout.insertLayout(3, self.transfer_area)
-        
+        # existing download button creation...
         self.download_button = QToolButton(self)
         self.download_button.setText("Download")
         self.download_menu = QMenu(self)
         self.download_button.setMenu(self.download_menu)
         self.download_button.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
-        self.download_button.setFixedWidth(90)
-        # place near file_button next to send_button/file_button (insert into layout)
+        self.download_button.setFixedHeight(36)
+        self.download_button.setMinimumWidth(120)
+
+        # make same style and font as other buttons (bold, matching padding)
+        self.download_button.setStyleSheet("""
+            QToolButton {
+                background-color: #89b4fa;
+                color: #1e1e2e;
+                border-radius: 8px;
+                padding: 8px 16px;
+                font-weight: bold;
+            }
+            QToolButton:hover { background-color: #74c7ec; }
+            QToolButton:pressed { background-color: #5e9bd5; }
+        """)
+
+
         self.line_layout.addWidget(self.download_button)
 
         # Hook: when download dropdown is clicked we refresh the files list
@@ -733,7 +763,9 @@ class ChatWidget(QWidget):
     # === File Download UI Methods ===
     def populate_download_menu(self, files_list):
         """
-        Populates the dropdown (combo box or menu) with files available for this client.
+        Populates the dropdown (combo box) with files available for this client.
+        Each combo entry stores the server-provided metadata dict as userData.
+        Expected server entry format: { "transfer_id", "filename", "size", "from", "timestamp" }
         """
         try:
             if not hasattr(self, "download_menu"):
@@ -751,34 +783,71 @@ class ChatWidget(QWidget):
                 hl.addWidget(self.download_menu)
                 hl.addWidget(self.download_button)
                 hl.addWidget(self.download_progress)
-                self.layout().addLayout(hl)
+                # prefer to add this to the same line layout the UI used earlier
+                try:
+                    self.line_layout.addLayout(hl)
+                except Exception:
+                    self.layout().addLayout(hl)
 
                 # Connect the button to trigger download
                 self.download_button.clicked.connect(self._start_file_download)
 
-            # Fill menu
+            # Fill menu: clear and add items storing the dict as data
             self.download_menu.clear()
-            for f in files_list:
-                self.download_menu.addItem(f)
+            for entry in files_list:
+                if isinstance(entry, dict):
+                    label = f"{entry.get('filename','<unknown>')} — from {entry.get('from','')}"
+                    self.download_menu.addItem(label, entry)
+                else:
+                    # fallback for legacy strings
+                    self.download_menu.addItem(str(entry), None)
         except Exception as e:
             print("[ChatWidget] populate_download_menu ERROR:", e)
+
+
 
     def _start_file_download(self):
         """
         Called when user clicks Download button.
-        Requests selected file from the server.
+        Requests selected file (by transfer_id) from the server.
         """
         try:
-            if not hasattr(self, "server_conn") and hasattr(self.parent(), "server_conn"):
-                self.server_conn = self.parent().server_conn
-            filename = self.download_menu.currentText()
-            if filename:
-                self.download_progress.setValue(0)
-                self.download_progress.setVisible(True)
-                msg = Message(self.parent().client.name, GET, FILE, filename)
+            # find server_conn via top-level window if not directly set
+            if not hasattr(self, "server_conn") and hasattr(self.window(), "server_conn"):
+                self.server_conn = self.window().server_conn
+
+            if not hasattr(self, "download_menu"):
+                return
+
+            data = self.download_menu.currentData()
+            if not data or not isinstance(data, dict):
+                # nothing selected or malformed entry
+                QMessageBox.information(self, "Download", "No file selected.")
+                return
+
+            transfer_id = data.get("transfer_id")
+            if not transfer_id:
+                QMessageBox.warning(self, "Download", "Selected file lacks transfer id.")
+                return
+
+            # show progress bar UI
+            self.download_progress.setValue(0)
+            self.download_progress.setVisible(True)
+
+            # Ask the server (via client-side ServerConnection wrapper) to stream this transfer
+            # We call the convenience method on server_conn which sends the correct message format.
+            # If server_conn is not available, fallback to manual send.
+            try:
+                self.server_conn.request_download(transfer_id)
+            except Exception:
+                # fallback
+                msg = Message(self.window().client.name, DOWNLOAD_FILE, FILE, {"transfer_id": transfer_id})
                 self.server_conn.send_msg(self.server_conn.main_socket, msg)
+
         except Exception as e:
             print("[ChatWidget] _start_file_download ERROR:", e)
+            QMessageBox.critical(self, "Error", f"Failed to request download: {e}")
+
 
     def update_download_progress(self, percent):
         """
@@ -843,6 +912,45 @@ class ChatWidget(QWidget):
         widget.progress.setValue(100)
         widget.save_btn.setEnabled(True)
         # keep the widget for a while so user can still click “Save…”
+        
+            # Called for outgoing uploads (sender UI)
+    def start_upload_transfer(self, upload_id: str, filename: str, total: int, to_names: tuple):
+        """Create an upload progress widget for an outgoing file."""
+        label_to = ", ".join(to_names) if isinstance(to_names, (list, tuple)) else str(to_names)
+        item = FileTransferItem(filename, total, self)
+        # tweak label to show "Uploading to X"
+        item.label.setText(f"Uploading to {label_to}: {filename} (0 / {self._human(total)})")
+        self.transfer_area.addWidget(item)
+        self.transfer_widgets[upload_id] = item
+
+    def update_upload_progress(self, upload_id: str, percent: int):
+        """Update outgoing upload progress widget by percent."""
+        if upload_id in self.transfer_widgets:
+            widget = self.transfer_widgets[upload_id]
+            try:
+                widget.progress.setValue(int(percent))
+                # also update text percentage (keep bytes text for incoming)
+                base_filename = os.path.basename(widget.label.text().split(':')[-1].strip().split(' (')[0])
+                widget.label.setText(f"{widget.label.text().split(':')[0]}: {base_filename} ({percent}%)")
+            except Exception:
+                pass
+
+    def finish_upload_transfer(self, upload_id: str):
+        """Mark outgoing upload complete."""
+        if upload_id in self.transfer_widgets:
+            widget = self.transfer_widgets[upload_id]
+            widget.progress.setValue(100)
+            widget.save_btn.setEnabled(False)
+            widget.save_btn.setText("Uploaded")
+            widget.save_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #a6e3a1;
+                    color: #1e1e2e;
+                    border-radius: 6px;
+                    padding: 4px 10px;
+                    font-weight: bold;
+                }
+            """)
     
     def _human(self, b: int) -> str:
         for unit in ['B', 'KB', 'MB', 'GB']:
@@ -956,26 +1064,6 @@ class MainWindow(QMainWindow):
         if not self.login_dialog.exec():
             exit()
         
-        # --- File download UI integration (safe insertion) ---
-        self.chat_widget = ChatWidget()
-        try:
-            # Try adding to whichever layout exists
-            if hasattr(self, "layout"):
-                self.layout.addWidget(self.chat_widget)
-            elif hasattr(self, "main_layout"):
-                self.main_layout.addWidget(self.chat_widget)
-            elif hasattr(self, "central_layout"):
-                self.central_layout.addWidget(self.chat_widget)
-            else:
-                # fallback: attach to central widget directly
-                self.setCentralWidget(self.chat_widget)
-        except Exception:
-            pass
-
-        self.server_conn.files_list_signal.connect(self.chat_widget.populate_download_menu)
-        self.server_conn.download_chunk_signal.connect(self.chat_widget.update_download_progress)
-        self.server_conn.download_chunk_signal.connect(self.chat_widget.download_complete)
-
         self.server_conn.name = self.login_dialog.get_name()
         self.client.name = self.server_conn.name
         self.server_conn.start()
@@ -1031,6 +1119,29 @@ class MainWindow(QMainWindow):
                 layout_action.setChecked(True)
             self.layout_menu.addAction(layout_action)
             self.layout_actions[res] = layout_action
+            
+        # Periodically refresh file list (every 5 seconds)
+        self.file_refresh_timer = QTimer()
+        self.file_refresh_timer.timeout.connect(self.server_conn.request_file_list)
+        self.file_refresh_timer.start(5000)  # 5 seconds
+
+            
+        # === FILE TRANSFER SIGNAL CONNECTIONS ===
+        self.server_conn.files_list_signal.connect(self.chat_widget.populate_download_menu)
+        self.server_conn.start_download_signal.connect(self.chat_widget.start_file_transfer)
+        self.server_conn.download_chunk_signal.connect(self.chat_widget.update_file_transfer)
+        self.server_conn.finish_download_signal.connect(self.chat_widget.finish_file_transfer)
+
+        # Upload (sender) progress signals
+        self.server_conn.start_upload_signal.connect(self.chat_widget.start_upload_transfer)
+        self.server_conn.upload_progress_signal.connect(self.chat_widget.update_upload_progress)
+        self.server_conn.finish_upload_signal.connect(self.chat_widget.finish_upload_transfer)
+        # when a new file is uploaded successfully, refresh file list for all
+        self.server_conn.finish_upload_signal.connect(
+            lambda _: self.server_conn.request_file_list()
+        )
+
+
     
     def capture_and_send_screen(self):
         if not self.client.screen_sharing:
