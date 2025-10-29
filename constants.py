@@ -2,27 +2,34 @@ import socket
 import struct
 import pickle
 from dataclasses import astuple, dataclass
+import time
 
+# Ports
 PORT = 53535
 MAIN_PORT = 53530
 VIDEO_PORT = 53531
 AUDIO_PORT = 53532
-# ADDR = ('', PORT)
-DISCONNECT = 'QUIT!'
-OK = 'OK'
 SIZE = 1024
 
 SERVER = 'SERVER'
+OK = 'OK'
 
-# requests
+# Requests
 GET = 'GET'
 POST = 'POST'
 ADD = 'ADD'
 RM = 'RM'
 START_SHARE = 'START_SHARE'
 STOP_SHARE = 'STOP_SHARE'
+DISCONNECT = 'QUIT!'
 
-# data types
+# File-related requests
+GET_FILES = 'GET_FILES'          # Client asks server for available files for that client
+DOWNLOAD_FILE = 'DOWNLOAD_FILE'  # Client asks server to start sending a file
+FILE_LIST = 'FILE_LIST'          # Server sends list of files (metadata)
+FILE_CHUNK = 'FILE_CHUNK'        # Server sends file chunks (or metadata start)
+
+# Data types
 VIDEO = 'Video'
 AUDIO = 'Audio'
 TEXT = 'Text'
@@ -31,13 +38,12 @@ SCREEN = 'Screen'
 
 MEDIA_SIZE = {VIDEO: 25000, AUDIO: 4500}
 
-import time
-
-def send_bytes(self, msg):
+# --- socket helpers (send/recv with length prefix) ---
+def send_bytes(self, msg: bytes):
     # Prefix each message with a 4-byte length (network byte order)
     try:
-        msg = struct.pack('>I', len(msg)) + msg
-        self.sendall(msg)
+        packet = struct.pack('>I', len(msg)) + msg
+        self.sendall(packet)
     except Exception as e:
         print(f"[send_bytes ERROR] {e} at {time.strftime('%H:%M:%S')}")
         raise
@@ -52,7 +58,7 @@ def recv_bytes(self):
     return self.recvall(msglen)
 
 def recvall(self, n):
-    # Helper function to recv n bytes or return None if EOF is hit
+    # Helper function to recv n bytes or return b'' if EOF is hit
     data = bytearray()
     while len(data) < n:
         try:
@@ -65,20 +71,24 @@ def recvall(self, n):
         data.extend(packet)
     return bytes(data)
 
-
 def disconnect(self):
     msg = Message(SERVER, DISCONNECT)
     try:
         self.send_bytes(pickle.dumps(msg))
     except (BrokenPipeError, ConnectionResetError, OSError):
         print(f"[ERROR] Connection not present")
-    self.close()
+    try:
+        self.close()
+    except Exception:
+        pass
 
+# Monkey-patch socket methods
 socket.socket.send_bytes = send_bytes
 socket.socket.recv_bytes = recv_bytes
 socket.socket.recvall = recvall
 socket.socket.disconnect = disconnect
 
+# --- Message dataclass ---
 @dataclass
 class Message:
     from_name: str
@@ -99,3 +109,4 @@ class Message:
     
     def __getitem__(self, keys):
         return iter(getattr(self, k) for k in keys)
+

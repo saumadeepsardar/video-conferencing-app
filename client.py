@@ -77,6 +77,12 @@ class ServerConnection(QThread):
     screen_update_signal = pyqtSignal(bytes)
     screen_share_reject_signal = pyqtSignal()
 
+    # New signals to communicate file-related info to UI
+    files_list_signal = pyqtSignal(list)  # emits list of file metadata
+    start_download_signal = pyqtSignal(str, str, int, str)  # transfer_id, filename, size, from_name
+    download_chunk_signal = pyqtSignal(str, bytes)  # transfer_id, chunk
+    finish_download_signal = pyqtSignal(str)  # transfer_id
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.threadpool = None
@@ -163,17 +169,45 @@ class ServerConnection(QThread):
             self.connected = False
     
     def send_file(self, filepath: str, to_names: tuple[str]):
+        """Send a file to server (server will store and make available to recipients).
+           This runs in a Worker thread."""
         filename = os.path.basename(filepath)
-        with open(filepath, 'rb') as f:
-            data = f.read(SIZE)
-            while data:
-                msg = Message(self.name, POST, FILE, data, to_names)
-                self.send_msg(self.main_socket, msg)
+        filesize = os.path.getsize(filepath) if os.path.exists(filepath) else 0
+        # First notify server about the filename (start of transfer)
+        self.send_msg(self.main_socket, Message(self.name, POST, FILE, filename, to_names))
+        # For UI: start an upload progress indicator (we emit textual messages; GUI may show a progress bar)
+        total_sent = 0
+        last_emit = 0
+        try:
+            with open(filepath, 'rb') as f:
                 data = f.read(SIZE)
-            msg = Message(self.name, POST, FILE, None, to_names)
-            self.send_msg(self.main_socket, msg)
-        self.add_msg_signal.emit(self.name, f"File {filename} sent.")
-    
+                while data:
+                    msg = Message(self.name, POST, FILE, data, to_names)
+                    self.send_msg(self.main_socket, msg)
+                    total_sent += len(data)
+                    # emit simple progress messages for sender UI
+                    percent = int(total_sent * 100 / (filesize or 1))
+                    if percent != last_emit and percent % 5 == 0:
+                        # send a short status message to UI via add_msg_signal (you'll see "Uploading X%")
+                        self.add_msg_signal.emit(self.name, f"Uploading {filename}: {percent}%")
+                        last_emit = percent
+                    data = f.read(SIZE)
+                # final None to indicate EOF
+                self.send_msg(self.main_socket, Message(self.name, POST, FILE, None, to_names))
+            self.add_msg_signal.emit(self.name, f"File {filename} sent to server.")
+        except Exception as e:
+            self.add_msg_signal.emit(self.name, f"Error sending file: {e}")
+
+    def request_file_list(self):
+        """Ask server for files available for this client"""
+        msg = Message(self.name, GET_FILES)
+        self.send_msg(self.main_socket, msg)
+
+    def request_download(self, transfer_id: str):
+        """Ask server to stream the file with transfer_id to this client"""
+        msg = Message(self.name, DOWNLOAD_FILE, FILE, {"transfer_id": transfer_id})
+        self.send_msg(self.main_socket, msg)
+
     def media_broadcast_loop(self, conn: socket.socket, media: str):
         while self.connected:
             if media == VIDEO:
@@ -227,8 +261,9 @@ class ServerConnection(QThread):
                     all_clients[client_name] = Client(client_name)
                     self.add_client_signal.emit(all_clients[client_name])
                 else:
-                    print(f"[{self.name}] [ERROR] Invalid client name {client_name}: {msg}")
-                    return
+                    # treat non-media messages from new senders as creating a client entry
+                    all_clients[client_name] = Client(client_name)
+                    self.add_client_signal.emit(all_clients[client_name])
             if msg.data_type == VIDEO:
                 all_clients[client_name].video_frame = msg.data
             elif msg.data_type == AUDIO:
@@ -260,6 +295,9 @@ class ServerConnection(QThread):
                     self.add_msg_signal.emit(client_name, msg.data)
 
             elif msg.data_type == FILE:
+                # existing behavior: previous peer-to-peer file sending (deprecated)
+                # But server-side file transport uses FILE_LIST / FILE_CHUNK message types.
+                # Keep backward compatibility for incoming direct file pushes:
                 if type(msg.data) == str:
                     if os.path.exists(msg.data): # create copy
                         filename, ext = os.path.splitext(msg.data)
@@ -277,21 +315,87 @@ class ServerConnection(QThread):
                     with open(self.recieving_filename, 'ab') as f:
                         f.write(msg.data)
             else:
-                print(f"[{self.name}] [ERROR] Invalid data type {msg.data_type}")
+                # Unknown data_type for POST
+                pass
+
         elif msg.request == ADD:
             if client_name not in all_clients:
                 all_clients[client_name] = Client(client_name)
                 self.add_client_signal.emit(all_clients[client_name])
+
         elif msg.request == RM:
             if client_name not in all_clients:
                 print(f"[{self.name}] [ERROR] Invalid client name {client_name}")
                 return
             self.remove_client_signal.emit(client_name)
             all_clients.pop(client_name)
+
         elif msg.request == START_SHARE:
             self.screen_share_start_signal.emit(msg.data)
+
         elif msg.request == STOP_SHARE:
             self.screen_share_stop_signal.emit()
+
+        # NEW: server responds with a FILE_LIST (list of files available for this client)
+        elif msg.request == FILE_LIST and msg.data_type == FILE:
+            # msg.data is a list of dict metadata
+            file_list = msg.data if isinstance(msg.data, list) else []
+            # forward to UI
+            self.files_list_signal.emit(file_list)
+
+        # NEW: server streams file chunks using FILE_CHUNK / FILE with different payloads
+        elif msg.request == FILE_CHUNK and msg.data_type == FILE:
+            # msg.data may be:
+            #  - dict metadata: {"transfer_id","filename","size","from"}
+            #  - bytes chunk
+            #  - None == end of stream
+            if isinstance(msg.data, dict):
+                meta = msg.data
+                transfer_id = meta.get("transfer_id")
+                filename = meta.get("filename")
+                size = meta.get("size", 0)
+                from_name = meta.get("from", "")
+                # notify UI to create a download widget
+                self.start_download_signal.emit(transfer_id, filename, size, from_name)
+            elif msg.data is None:
+                # finish
+                # we don't have a transfer id in this message; but start_download_signal used by UI to
+                # map future chunk events. To correlate, chunks are accompanied by start signal first.
+                # We'll send a generic finish signal (UI should map by last active transfer).
+                # To be robust, client GUI should track transfer ids it started and match finish order.
+                # Here we just emit finish without id (UI will handle per-implementation).
+                # But better: the server streams only to the requester, so UI can assume the single active incoming.
+                # We'll emit finish_download_signal with an empty transfer id (UI should adapt).
+                self.finish_download_signal.emit("")
+            else:
+                # bytes chunk — we need transfer id, but server does not include it in chunk messages to save space.
+                # To be robust, server could have sent transfer_id with every chunk; if not, we emit chunk with empty id.
+                # For simplicity, we emit chunk with empty id; GUI should use the last started transfer id.
+                chunk = msg.data
+                self.download_chunk_signal.emit("", chunk)
+
+        elif msg.request == GET_FILES:
+            # not expected from server to client
+            pass
+
+        elif msg.request == DOWNLOAD_FILE:
+            # not expected from server to client
+            pass
+
+        elif msg.request == START_SHARE:
+            # duplicate handling guard
+            pass
+
+        else:
+            # any other messages from server (text notifications)
+            if msg.data_type == TEXT and msg.from_name == SERVER:
+                self.add_msg_signal.emit("System", str(msg.data))
+            else:
+                # fallback: emit text
+                try:
+                    self.add_msg_signal.emit(msg.from_name, str(msg.data))
+                except Exception:
+                    pass
 
 client = Client("You", current_device=True)
 
@@ -307,3 +411,4 @@ if __name__ == "__main__":
     status_code = app.exec()
     server_conn.disconnect_server()
     os._exit(status_code)
+

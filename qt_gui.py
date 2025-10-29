@@ -9,7 +9,8 @@ from PyQt6.QtGui import QImage, QPixmap, QActionGroup, QIcon, QFont, QAction
 from PyQt6.QtWidgets import QMainWindow, QVBoxLayout, QHBoxLayout, QGridLayout, QDockWidget \
     , QLabel, QWidget, QListWidget, QListWidgetItem, QMessageBox \
     , QComboBox, QTextEdit, QLineEdit, QPushButton, QFileDialog \
-    , QDialog, QMenu, QWidgetAction, QCheckBox, QStyleFactory, QGraphicsDropShadowEffect, QSpacerItem, QSizePolicy
+    , QDialog, QMenu, QWidgetAction, QCheckBox, QStyleFactory, QGraphicsDropShadowEffect \
+    , QSpacerItem, QSizePolicy, QProgressBar, QMenuBar, QToolButton,QInputDialog
 
 from constants import *
 
@@ -700,6 +701,126 @@ class ChatWidget(QWidget):
         self.transfer_area.setSpacing(4)
         self.layout.insertLayout(3, self.transfer_area)
         
+        self.download_button = QToolButton(self)
+        self.download_button.setText("Download")
+        self.download_menu = QMenu(self)
+        self.download_button.setMenu(self.download_menu)
+        self.download_button.setPopupMode(QToolButton.ToolButtonPopupMode.MenuButtonPopup)
+        self.download_button.setFixedWidth(90)
+        # place near file_button next to send_button/file_button (insert into layout)
+        self.line_layout.addWidget(self.download_button)
+
+        # Hook: when download dropdown is clicked we refresh the files list
+        self.download_button.clicked.connect(self._on_download_clicked)
+        # maintain mapping transfer_id -> FileTransferItem (incoming)
+        self.transfer_widgets: dict[str, FileTransferItem] = {}
+        # existing transfer_area code remains
+        
+        
+    def _on_download_clicked(self):
+        # request server for file list for this client
+        # server_conn is not directly available here; the MainWindow will connect server->files_list_signal
+        # We rely on MainWindow to call server_conn.request_file_list() when needed
+        # Emit a placeholder message so MainWindow can trigger a request
+        # We will instead call the top-level window's server_conn if available
+        try:
+            parent = self.window()
+            if hasattr(parent, 'server_conn') and parent.server_conn is not None:
+                parent.server_conn.request_file_list()
+        except Exception as e:
+            print(f"[ERROR] Could not request file list: {e}")
+
+    # === File Download UI Methods ===
+    def populate_download_menu(self, files_list):
+        """
+        Populates the dropdown (combo box or menu) with files available for this client.
+        """
+        try:
+            if not hasattr(self, "download_menu"):
+                from PyQt6.QtWidgets import QComboBox, QPushButton, QHBoxLayout, QProgressBar
+
+                # Create UI elements dynamically if not present
+                self.download_menu = QComboBox()
+                self.download_menu.setMinimumWidth(200)
+                self.download_button = QPushButton("Download")
+                self.download_progress = QProgressBar()
+                self.download_progress.setValue(0)
+                self.download_progress.setVisible(False)
+
+                hl = QHBoxLayout()
+                hl.addWidget(self.download_menu)
+                hl.addWidget(self.download_button)
+                hl.addWidget(self.download_progress)
+                self.layout().addLayout(hl)
+
+                # Connect the button to trigger download
+                self.download_button.clicked.connect(self._start_file_download)
+
+            # Fill menu
+            self.download_menu.clear()
+            for f in files_list:
+                self.download_menu.addItem(f)
+        except Exception as e:
+            print("[ChatWidget] populate_download_menu ERROR:", e)
+
+    def _start_file_download(self):
+        """
+        Called when user clicks Download button.
+        Requests selected file from the server.
+        """
+        try:
+            if not hasattr(self, "server_conn") and hasattr(self.parent(), "server_conn"):
+                self.server_conn = self.parent().server_conn
+            filename = self.download_menu.currentText()
+            if filename:
+                self.download_progress.setValue(0)
+                self.download_progress.setVisible(True)
+                msg = Message(self.parent().client.name, GET, FILE, filename)
+                self.server_conn.send_msg(self.server_conn.main_socket, msg)
+        except Exception as e:
+            print("[ChatWidget] _start_file_download ERROR:", e)
+
+    def update_download_progress(self, percent):
+        """
+        Updates the progress bar as download proceeds.
+        """
+        try:
+            if hasattr(self, "download_progress"):
+                self.download_progress.setVisible(True)
+                self.download_progress.setValue(int(percent))
+        except Exception as e:
+            print("[ChatWidget] update_download_progress ERROR:", e)
+
+    def download_complete(self, filename):
+        """
+        Called when file download finishes.
+        """
+        try:
+            if hasattr(self, "download_progress"):
+                self.download_progress.setValue(100)
+                self.download_progress.setVisible(False)
+            self.add_message(f"Download complete: {filename}")
+        except Exception as e:
+            print("[ChatWidget] download_complete ERROR:", e)
+    # === End File Download UI Methods ===
+
+
+    def _download_action_triggered(self, action):
+        entry = action.data()
+        if not entry:
+            return
+        transfer_id = entry.get("transfer_id")
+        filename = entry.get("filename")
+        size = entry.get("size", 0)
+        # Ask main window's server_conn to start the download
+        try:
+            parent = self.window()
+            if hasattr(parent, 'server_conn') and parent.server_conn is not None:
+                parent.server_conn.request_download(transfer_id)
+                # UI: create an incoming transfer widget so user sees progress
+                self.start_file_transfer(transfer_id, filename, size, entry.get("from", ""))
+        except Exception as e:
+            print(f"[ERROR] download request failed: {e}")
     def start_file_transfer(self, transfer_id: str, filename: str, total: int, from_name: str):
         """Called when a file starts arriving."""
         item = FileTransferItem(filename, total, self)
@@ -835,6 +956,26 @@ class MainWindow(QMainWindow):
         if not self.login_dialog.exec():
             exit()
         
+        # --- File download UI integration (safe insertion) ---
+        self.chat_widget = ChatWidget()
+        try:
+            # Try adding to whichever layout exists
+            if hasattr(self, "layout"):
+                self.layout.addWidget(self.chat_widget)
+            elif hasattr(self, "main_layout"):
+                self.main_layout.addWidget(self.chat_widget)
+            elif hasattr(self, "central_layout"):
+                self.central_layout.addWidget(self.chat_widget)
+            else:
+                # fallback: attach to central widget directly
+                self.setCentralWidget(self.chat_widget)
+        except Exception:
+            pass
+
+        self.server_conn.files_list_signal.connect(self.chat_widget.populate_download_menu)
+        self.server_conn.download_chunk_signal.connect(self.chat_widget.update_download_progress)
+        self.server_conn.download_chunk_signal.connect(self.chat_widget.download_complete)
+
         self.server_conn.name = self.login_dialog.get_name()
         self.client.name = self.server_conn.name
         self.server_conn.start()

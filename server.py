@@ -15,6 +15,28 @@ video_conn = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 audio_conn = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 media_conns = {VIDEO: video_conn, AUDIO: audio_conn}
 
+# Directory to store uploaded files
+DATA_DIR = "data"
+os.makedirs(DATA_DIR, exist_ok=True)
+
+# Keep an index of saved files per recipient:
+# files_index[recipient] = list of dicts: { "transfer_id": str, "filename": str, "path": str, "size": int, "from": str, "timestamp": float }
+files_index: dict[str, list] = {}
+
+# Temporary open file handles for ongoing transfers:
+# active_transfers[(from_name, filename, transfer_id)] = { recipient_name: file_obj, ... }
+active_transfers: dict[tuple, dict] = {}
+
+def safe_filename(directory: str, filename: str) -> str:
+    """Return a unique filename inside directory"""
+    base, ext = os.path.splitext(filename)
+    candidate = filename
+    i = 1
+    while os.path.exists(os.path.join(directory, candidate)):
+        candidate = f"{base}({i}){ext}"
+        i += 1
+    return candidate
+
 @dataclass
 class Client:
     name: str
@@ -70,6 +92,174 @@ def media_server(media: str, port: int):
         else:
             broadcast_msg(msg.from_name, msg.request, msg.data_type, msg.data)
 
+def ensure_files_index_for(recipient: str):
+    if recipient not in files_index:
+        files_index[recipient] = []
+
+def add_file_index(recipient: str, filename: str, path: str, size: int, from_name: str, transfer_id: str):
+    ensure_files_index_for(recipient)
+    files_index[recipient].append({
+        "transfer_id": transfer_id,
+        "filename": filename,
+        "path": path,
+        "size": size,
+        "from": from_name,
+        "timestamp": time.time()
+    })
+
+def handle_file_post(msg: Message, from_name: str):
+    """
+    msg.data semantics:
+      - If str: this is the start-of-transfer announcement (filename string)
+      - If bytes: chunk to be appended
+      - If None: end-of-transfer marker
+    msg.to_names: recipients tuple
+    """
+    global active_transfers
+    if not msg.to_names:
+        # treat as broadcast to all clients (store for all)
+        recipients = [name for name in clients.keys() if name != from_name]
+    else:
+        recipients = [n for n in msg.to_names if n in clients]
+
+    if isinstance(msg.data, str):
+        # start-of-transfer (filename)
+        filename = os.path.basename(msg.data)
+        transfer_id = f"{from_name}_{filename}_{int(time.time()*1000)}"
+        # create per-recipient files and open handles
+        handles = {}
+        for r in recipients:
+            rdir = os.path.join(DATA_DIR, r)
+            os.makedirs(rdir, exist_ok=True)
+            safe_name = safe_filename(rdir, filename)
+            path = os.path.join(rdir, safe_name)
+            try:
+                fobj = open(path, 'wb')
+            except Exception as e:
+                print(f"[ERROR] Failed to open file for writing {path}: {e}")
+                continue
+            handles[r] = {"fileobj": fobj, "path": path, "filename": safe_name}
+            # add a preliminary index entry (size 0 for now) so it appears in lists quickly
+            add_file_index(r, safe_name, path, 0, from_name, transfer_id)
+        # store in active_transfers keyed by (from_name, filename, transfer_id)
+        active_transfers[(from_name, filename, transfer_id)] = handles
+        print(f"[FILE] Starting transfer {transfer_id} from {from_name} -> {recipients}")
+        return
+
+    # find which active transfer this chunk belongs to
+    # We will search active_transfers keys by matching from_name and one filename that matches
+    matched_keys = [k for k in active_transfers.keys() if k[0] == from_name]
+    if not matched_keys:
+        print(f"[WARN] Received file chunk but no active transfer from {from_name}")
+        return
+
+    # We treat chunk messages as applying to the most recent transfer from this sender
+    # (since client sends start filename first, then chunks, then None end marker)
+    matched_keys.sort(key=lambda k: k[2], reverse=True)  # newest first
+    transfer_key = matched_keys[0]
+    handles = active_transfers.get(transfer_key)
+
+    if msg.data is None:
+        # End of transfer: close all handles and update sizes
+        for r, info in list(handles.items()):
+            try:
+                fobj = info["fileobj"]
+                path = info["path"]
+                fobj.close()
+                size = os.path.getsize(path)
+                # update index entry for this recipient and transfer_id
+                ensure_files_index_for(r)
+                # find entry by transfer_id and filename (path)
+                for entry in files_index[r]:
+                    if entry["transfer_id"] == transfer_key[2] and entry["filename"] == info["filename"]:
+                        entry["size"] = size
+                        break
+            except Exception as e:
+                print(f"[ERROR] Closing file for {r}: {e}")
+        # remove active transfer entry
+        try:
+            del active_transfers[transfer_key]
+        except KeyError:
+            pass
+        print(f"[FILE] Completed transfer {transfer_key[2]} from {from_name}")
+        # optionally, notify recipients that files are available (could be done on GET_FILES request)
+        return
+
+    # it's a bytes chunk: write to each recipient's file
+    if isinstance(msg.data, (bytes, bytearray)):
+        for r, info in handles.items():
+            try:
+                fobj = info["fileobj"]
+                fobj.write(msg.data)
+            except Exception as e:
+                print(f"[ERROR] Writing chunk for {r}: {e}")
+    else:
+        print(f"[WARN] Unexpected file data type from {from_name}: {type(msg.data)}")
+
+def send_file_list_to(client_name: str):
+    """
+    Prepare a list of files available for client_name and send as FILE_LIST.
+    The data payload will be a list of dicts: {transfer_id, filename, size, from, timestamp}
+    """
+    ensure_files_index_for(client_name)
+    entries = files_index.get(client_name, [])
+    # make a shallow copy with only necessary fields
+    send_list = [
+        {
+            "transfer_id": e["transfer_id"],
+            "filename": e["filename"],
+            "size": e["size"],
+            "from": e["from"],
+            "timestamp": e.get("timestamp", 0)
+        } for e in entries
+    ]
+    # send from SERVER
+    if client_name in clients:
+        clients[client_name].send_msg(SERVER, FILE_LIST, FILE, send_list)
+
+def handle_download_request(msg: Message, requester_name: str):
+    """
+    msg.data expected to be a dict: { "transfer_id": str }
+    Server will stream file chunks for that transfer to the requester only.
+    """
+    if not isinstance(msg.data, dict) or "transfer_id" not in msg.data:
+        clients[requester_name].send_msg(SERVER, POST, TEXT, "Invalid download request")
+        return
+    transfer_id = msg.data["transfer_id"]
+    # Find the file entry for requester
+    ensure_files_index_for(requester_name)
+    entry = None
+    for e in files_index.get(requester_name, []):
+        if e["transfer_id"] == transfer_id:
+            entry = e
+            break
+    if entry is None:
+        clients[requester_name].send_msg(SERVER, POST, TEXT, "Requested file not found")
+        return
+    path = entry["path"]
+    filename = entry["filename"]
+    size = entry["size"]
+    # send a FILE_CHUNK metadata start message with size & filename
+    metadata = {"transfer_id": transfer_id, "filename": filename, "size": size, "from": entry.get("from", "")}
+    clients[requester_name].send_msg(SERVER, FILE_CHUNK, FILE, metadata)
+    # stream file in chunks
+    try:
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(SIZE)
+                if not chunk:
+                    break
+                clients[requester_name].send_msg(SERVER, FILE_CHUNK, FILE, chunk)
+                # small sleep to avoid flooding
+                time.sleep(0.001)
+    except Exception as e:
+        print(f"[ERROR] Error while sending file {path} to {requester_name}: {e}")
+        clients[requester_name].send_msg(SERVER, POST, TEXT, f"Error streaming file: {e}")
+        return
+    # send final None marker to indicate end
+    clients[requester_name].send_msg(SERVER, FILE_CHUNK, FILE, None)
+    print(f"[FILE] Completed streaming {filename} ({transfer_id}) to {requester_name}")
+
 def disconnect_client(client: Client):
     global clients, current_presenter
     print(f"[DISCONNECT] {client.name} disconnected from Main Server")
@@ -79,7 +269,10 @@ def disconnect_client(client: Client):
     client.media_addrs.update({VIDEO: None, AUDIO: None})
     client.connected = False
     broadcast_msg(client.name, RM)
-    client.main_conn.disconnect()
+    try:
+        client.main_conn.disconnect()
+    except Exception:
+        pass
     try:
         clients.pop(client.name)
     except KeyError:
@@ -108,11 +301,13 @@ def handle_main_conn(name: str):
             print(f"[{name}] [ERROR] UnpicklingError")
             continue
 
+        # debug print can be useful
         print(msg)
 
         if msg.request == DISCONNECT:
             break
-            
+
+        # SCREEN sharing logic unchanged
         elif msg.request == START_SHARE:
             if current_presenter is None:
                 current_presenter = name
@@ -125,31 +320,39 @@ def handle_main_conn(name: str):
                 # send rejection to requester only
                 clients[name].send_msg(SERVER, POST, TEXT, "Screen sharing already active by another user")
 
-
         elif msg.request == STOP_SHARE:
             if current_presenter == name:
                 current_presenter = None
                 broadcast_msg(SERVER, STOP_SHARE, SCREEN)
                 print(f"[SHARE] {name} stopped screen sharing")
             else:
-                client.send_msg(SERVER, POST, TEXT, "You are not the current presenter")
-        elif msg.request == POST and msg.data_type == SCREEN:
-            # Only presenter may send screen frames
-            print(name)
-            if current_presenter == name:
-                if not msg.data:
-                    # skip empty frames
-                    continue
-                # forward to everyone except the presenter
-                for c in clients.values():
-                        try:
-                            c.send_msg(name, msg.request, msg.data_type, msg.data)
-                        except Exception as e:
-                            print(f"[ERROR] Failed to forward screen frame to {c.name}: {e}")
-            else:
                 clients[name].send_msg(SERVER, POST, TEXT, "You are not the current presenter")
 
+        # FILE transfer posted by a client (server stores it)
+        elif msg.request == POST and msg.data_type == FILE:
+            try:
+                handle_file_post(msg, name)
+            except Exception as e:
+                print(f"[ERROR] handle_file_post: {e}")
+                traceback.print_exc()
+
+        # Client requests list of files available for them
+        elif msg.request == GET_FILES:
+            # msg.from_name is the requester
+            try:
+                send_file_list_to(name)
+            except Exception as e:
+                print(f"[ERROR] send_file_list_to: {e}")
+
+        # Client requests server to stream a particular file to them
+        elif msg.request == DOWNLOAD_FILE and msg.data_type == FILE:
+            try:
+                handle_download_request(msg, name)
+            except Exception as e:
+                print(f"[ERROR] handle_download_request: {e}")
+
         else:
+            # default behavior: forward as multicast (text, video, audio, etc.)
             multicast_msg(name, msg.request, msg.to_names, msg.data_type, msg.data)
 
     disconnect_client(client)
@@ -184,7 +387,7 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print(traceback.format_exc())
         print(f"[EXITING] Keyboard Interrupt")
-        for client in clients.values():
+        for client in list(clients.values()):
             disconnect_client(client)
     except Exception as e:
         print(f"[ERROR] {e}")
