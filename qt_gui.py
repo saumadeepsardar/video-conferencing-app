@@ -359,14 +359,14 @@ class ScreenShareWidget(QWidget):
         super().__init__(parent)
         self.presenter_name = ""
         self.maximized = False
-        self.original_parent = None
-        self.original_layout = None
-        self.video_list_widget = None
         self.default_height = 300
         self.last_image_bytes = None
-        self.setMinimumHeight(self.default_height)
-        self.setMaximumHeight(self.default_height)
 
+        # Use size policy so layout controls width; we only control heights
+        sp = QSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.setSizePolicy(sp)
+
+        # UI
         self.presenter_label = QLabel("Screen Share by: None")
         self.presenter_label.setStyleSheet("color: #f9e2af; font-weight: bold;")
         self.presenter_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -377,10 +377,11 @@ class ScreenShareWidget(QWidget):
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
         layout.addWidget(self.presenter_label)
         layout.addWidget(self.screen_viewer, 1)
 
-        # Floating maximize button
+        # Maximize button (only changes height constraints)
         self.max_btn = QPushButton(self)
         self.max_btn.setIcon(QIcon("img/maximise.png"))
         self.max_btn.setIconSize(QSize(20, 20))
@@ -396,93 +397,73 @@ class ScreenShareWidget(QWidget):
         """)
         self.max_btn.setFlat(True)
         self.max_btn.clicked.connect(self.toggle_maximize)
-
-        # Position button at top-right corner
         self.max_btn.raise_()
-        self.max_btn.move(self.width() - 45, 10)
+
+        # ensure stable initial heights (minimized state)
+        self.set_minimized_height()
 
     def resizeEvent(self, event):
-        # Reposition floating button on resize
-        self.max_btn.move(self.width() - 45, 10)
+        # keep button anchored to top-right of widget
+        try:
+            self.max_btn.move(self.width() - 45, 10)
+        except Exception:
+            pass
         super().resizeEvent(event)
 
+    def set_minimized_height(self, factor: float = 0.5):
+        """Set widget's height to fraction of window height (default 50%)."""
+        w = self.window()
+        total = w.height() if w and hasattr(w, "height") else 800
+        h = max(120, int(total * factor))
+        self.setMinimumHeight(h)
+        self.setMaximumHeight(h)
+
+    def set_maximized_height(self):
+        w = self.window()
+        total = w.height() if w and hasattr(w, "height") else 800
+        self.setMinimumHeight(total)
+        self.setMaximumHeight(total)
+
     def toggle_maximize(self):
-        """Toggle maximize/restore for screen share panel"""
-        main_window = self.window()
-        central_widget = main_window.centralWidget()
-        central_layout = central_widget.layout()
-
+        """Toggle maximize/restore while staying in layout and keeping fixed width."""
         if not self.maximized:
-            # Save references
-            self.original_parent = self.parent()
-            self.original_layout = self.original_parent.layout() if self.original_parent else None
-            if self.original_layout:
-                self.original_layout.removeWidget(self)
+            # --- MAXIMIZE: only vertical expansion ---
+            # capture current width so it doesn't stretch horizontally
+            self.fixed_width = self.width()
+            self.setFixedWidth(self.fixed_width)
 
-            # Hide sidebar to cover its area
-            self.sidebar = next((d for d in main_window.findChildren(QDockWidget) if d.windowTitle() == "Chat"), None)
-            if self.sidebar:
-                self.sidebar.hide()
-
-            # Remove video_list from layout to free space
-            video_item = central_layout.takeAt(0)
-            if video_item:
-                self.video_list_widget = video_item.widget()
-
-            # Remove size constraints to allow full expansion
-            self.setMinimumHeight(0)
-            self.setMaximumHeight(16777215)
-
-            # Re-add to central layout at the end to keep "bottom" positioning
-            central_layout.addWidget(self)
-            self.show()
-
-            # Hide label for full coverage
-            self.presenter_label.hide()
-
-            # Update button
+            self.set_maximized_height()
             self.max_btn.setIcon(QIcon("img/restore.png"))
-            self.max_btn.setToolTip("Restore screen share")
-
+            self.max_btn.setToolTip("Restore to minimized height")
             self.maximized = True
-            self.update()
 
-            # Refresh the image if available
-            if self.last_image_bytes:
-                self.show_share(self.presenter_name, self.last_image_bytes, is_presenter=False)
         else:
-            # Restore: re-add video_list and show sidebar
-            central_layout.removeWidget(self)
+            # --- RESTORE: unlock width, go back to minimized height ---
+            if hasattr(self, "fixed_width"):
+                # allow layout to manage width again
+                self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+                self.setMinimumWidth(0)
+                self.setMaximumWidth(16777215)
 
-            if self.video_list_widget:
-                central_layout.insertWidget(0, self.video_list_widget)
-                self.video_list_widget = None
-
-            if self.sidebar:
-                self.sidebar.show()
-                self.sidebar = None
-
-            # Restore size constraints
-            self.setMinimumHeight(self.default_height)
-            self.setMaximumHeight(self.default_height)
-
-            # Show label
-            self.presenter_label.show()
-
-            # Re-add to original layout if exists
-            if self.original_layout:
-                self.original_layout.addWidget(self)
-
-            # Update button
+            self.set_minimized_height()
             self.max_btn.setIcon(QIcon("img/maximise.png"))
-            self.max_btn.setToolTip("Maximize screen share")
-
+            self.max_btn.setToolTip("Maximize vertically")
             self.maximized = False
-            self.show()
-            self.update()
+
+        # relayout parent cleanly
+        if self.parent() and hasattr(self.parent(), "layout"):
+            parent_layout = self.parent().layout()
+            parent_layout.invalidate()
+            parent_layout.update()
+
 
     def show_share(self, presenter_name, image_bytes, is_presenter=False):
+        """Render the shared screen (safe, idempotent)."""
         self.presenter_name = presenter_name
+
+        # ensure minimized height on first show unless maximized state already set
+        if not self.maximized:
+            self.set_minimized_height()
 
         if is_presenter:
             self.presenter_label.setText("You are now presenting your screen")
@@ -491,6 +472,7 @@ class ScreenShareWidget(QWidget):
             self.max_btn.hide()
             return
 
+        # show button if not presenter
         self.max_btn.show()
         self.presenter_label.setText(f"Screen shared by: {presenter_name}")
 
@@ -503,11 +485,8 @@ class ScreenShareWidget(QWidget):
                     bytes_per_line = ch * w
                     q_img = QImage(image.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
                     pixmap = QPixmap.fromImage(q_img)
-
-                    # Scale to screen viewer size
-                    target_size = self.screen_viewer.size()
                     pixmap = pixmap.scaled(
-                        target_size,
+                        self.screen_viewer.size(),
                         Qt.AspectRatioMode.KeepAspectRatio,
                         Qt.TransformationMode.SmoothTransformation
                     )
@@ -515,10 +494,12 @@ class ScreenShareWidget(QWidget):
                     self.last_image_bytes = image_bytes
                     return
             except Exception as e:
-                print(f"[ERROR] Failed to render screen share image: {e}")
+                print(f"[ScreenShareWidget] Failed to render image: {e}")
 
         self.screen_viewer.setText("Waiting for screen data...")
         self.last_image_bytes = None
+
+
 
 class VideoListWidget(QListWidget):
     def __init__(self, parent=None):
@@ -552,16 +533,36 @@ class VideoListWidget(QListWidget):
 
     
     def add_screen_share(self, presenter_name, image_bytes, is_presenter=False):
-        if not self.screen_share_widget:
-            self.screen_share_widget = ScreenShareWidget()
-            self.parentWidget().layout().addWidget(self.screen_share_widget)
-        self.screen_share_widget.show_share(presenter_name, image_bytes, is_presenter)
+        """
+        Ensure only a single screen_share_widget is created and reused.
+        Do NOT re-add multiple times to the layout — only show/hide/update.
+        """
+        try:
+            # create only once
+            if not self.screen_share_widget:
+                self.screen_share_widget = ScreenShareWidget(parent=self.parentWidget())
+                # place widget at top of central layout if not already present
+                central_layout = self.parentWidget().layout()
+                if central_layout is not None and central_layout.indexOf(self.screen_share_widget) == -1:
+                    # add at index 0 so it's on top; layout will manage sizing
+                    central_layout.insertWidget(0, self.screen_share_widget)
+                # make sure the widget does not get duplicated
+            # just update content — do not re-parent or add again
+            self.screen_share_widget.show_share(presenter_name, image_bytes, is_presenter)
+            self.screen_share_widget.show()
+        except Exception as e:
+            print(f"[VideoListWidget] add_screen_share ERROR: {e}")
 
     def remove_screen_share(self):
-        if self.screen_share_widget:
-            self.screen_share_widget.setParent(None)
-            self.screen_share_widget.deleteLater()
-            self.screen_share_widget = None
+        """Hide the screen share widget but keep the instance for reuse."""
+        try:
+            if self.screen_share_widget:
+                # simply hide; do not delete
+                self.screen_share_widget.hide()
+                # reset last image but keep object to avoid recreate loops
+                self.screen_share_widget.last_image_bytes = None
+        except Exception as e:
+            print(f"[VideoListWidget] remove_screen_share ERROR: {e}")
 
     def resize_widgets(self, res: str = None):
         global FRAME_WIDTH, FRAME_HEIGHT, LAYOUT_RES
@@ -1069,39 +1070,84 @@ class LoginDialog(QDialog):
         self.init_ui()
     
     def init_ui(self):
-        self.setWindowTitle("Login")
+        self.setWindowTitle("Connect to Server")
         self.setStyleSheet(MODERN_STYLESHEET)
 
         self.layout = QGridLayout()
         self.setLayout(self.layout)
 
+        # --- Labels ---
+        self.ip_label = QLabel("Server IP", self)
+        self.ip_label.setStyleSheet("font-weight: bold; color: #f9e2af;")
+        self.layout.addWidget(self.ip_label, 0, 0)
+
         self.name_label = QLabel("Username", self)
         self.name_label.setStyleSheet("font-weight: bold; color: #f9e2af;")
-        self.layout.addWidget(self.name_label, 0, 0)
+        self.layout.addWidget(self.name_label, 1, 0)
+
+        # --- Input Fields ---
+        self.ip_edit = QLineEdit(self)
+        self.ip_edit.setPlaceholderText("e.g. 192.168.1.10")
+        self.layout.addWidget(self.ip_edit, 0, 1)
 
         self.name_edit = QLineEdit(self)
-        self.layout.addWidget(self.name_edit, 0, 1)
+        self.name_edit.setPlaceholderText("Enter your username")
+        self.layout.addWidget(self.name_edit, 1, 1)
 
-        self.button = QPushButton("Login", self)
-        self.button.setStyleSheet("background-color: #a6e3a1; color: #1e1e2e; font-weight: bold;")
-        self.layout.addWidget(self.button, 1, 1)
+        # --- Connect Button ---
+        self.button = QPushButton("Connect", self)
+        self.button.setStyleSheet("""
+            QPushButton {
+                background-color: #a6e3a1;
+                color: #1e1e2e;
+                font-weight: bold;
+                border-radius: 8px;
+                padding: 6px 12px;
+            }
+            QPushButton:hover {
+                background-color: #94e2d5;
+            }
+            QPushButton:pressed {
+                background-color: #74c7ec;
+            }
+        """)
+        self.layout.addWidget(self.button, 2, 1)
 
+        # --- Signals ---
         self.button.clicked.connect(self.login)
-    
+
+        # --- Window Defaults ---
+        self.setFixedSize(380, 150)
+        self.setModal(True)
+        self.ip_edit.setFocus()
+
+    def get_ip(self):
+        """Return the entered server IP"""
+        return self.ip_edit.text().strip()
+
     def get_name(self):
-        return self.name_edit.text()
-    
+        """Return the entered username"""
+        return self.name_edit.text().strip()
+
     def login(self):
-        if self.get_name() == "":
+        ip = self.get_ip()
+        name = self.get_name()
+
+        if ip == "":
+            QMessageBox.critical(self, "Error", "Server IP cannot be empty")
+            return
+        if name == "":
             QMessageBox.critical(self, "Error", "Username cannot be empty")
             return
-        if " " in self.get_name():
+        if " " in name:
             QMessageBox.critical(self, "Error", "Username cannot contain spaces")
             return
+
         self.accept()
-    
+
     def close(self):
         self.reject()
+
 
 
 class MainWindow(QMainWindow):
@@ -1322,21 +1368,21 @@ class MainWindow(QMainWindow):
             self.chat_widget.share_button.setEnabled(True)
         else:
             # Another user is sharing
-            self.video_list_widget.add_screen_share(presenter_name, b'')
+            self.video_list_widget.add_screen_share(presenter_name, b'', is_presenter=False)
             self.screen_share_active = False
             self.other_sharing = True
             self.chat_widget.share_button.setText("Other is Sharing")
             self.chat_widget.share_button.setEnabled(False)
 
-
     def on_screen_update(self, image_bytes):
         if self.current_presenter:
             if not image_bytes:
-                # nothing to show
-                print("[DEBUG] on_screen_update received empty image_bytes")
-                self.video_list_widget.add_screen_share(self.current_presenter, b'')
+                # keep widget visible but show placeholder
+                self.video_list_widget.add_screen_share(self.current_presenter, b'', is_presenter=False)
                 return
-            self.video_list_widget.add_screen_share(self.current_presenter, image_bytes)
+            # forward bytes to the existing widget instance
+            self.video_list_widget.add_screen_share(self.current_presenter, image_bytes, is_presenter=False)
+
 
 
     def on_screen_share_stop(self):

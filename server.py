@@ -37,6 +37,16 @@ def safe_filename(directory: str, filename: str) -> str:
         i += 1
     return candidate
 
+
+# --- add this helper near top of file ---
+def valid_file(path: str) -> bool:
+    """Check that file exists and has non-zero size"""
+    try:
+        return os.path.exists(path) and os.path.getsize(path) > 0
+    except Exception:
+        return False
+
+
 @dataclass
 class Client:
     name: str
@@ -171,30 +181,28 @@ def handle_file_post(msg: Message, from_name: str):
                 fobj = info["fileobj"]
                 path = info["path"]
                 fobj.close()
+
+                if not valid_file(path):
+                    print(f"[WARN] Skipping empty or invalid file {path}")
+                    if os.path.exists(path):
+                        os.remove(path)
+                    continue
+
                 size = os.path.getsize(path)
-                if size > 0:
-                    ensure_files_index_for(r)
-                    # update or replace any placeholder 0-byte entry
-                    updated = False
-                    for entry in files_index[r]:
-                        if entry["transfer_id"] == transfer_key[2] and entry["filename"] == info["filename"]:
-                            entry["size"] = size
-                            updated = True
-                            break
-                    if not updated:
-                        add_file_index(r, info["filename"], path, size, from_name, transfer_key[2])
-                else:
-                    print(f"[WARN] Skipping empty file {path} (0 bytes)")
-                    os.remove(path)
+                ensure_files_index_for(r)
+                updated = False
+                for entry in files_index[r]:
+                    if entry["transfer_id"] == transfer_key[2] and entry["filename"] == info["filename"]:
+                        entry["size"] = size
+                        updated = True
+                        break
+                if not updated:
+                    add_file_index(r, info["filename"], path, size, from_name, transfer_key[2])
 
             except Exception as e:
                 print(f"[ERROR] Closing file for {r}: {e}")
 
-        try:
-            del active_transfers[transfer_key]
-        except KeyError:
-            pass
-
+        active_transfers.pop(transfer_key, None)
         print(f"[FILE] Completed transfer {transfer_key[2]} from {from_name}")
         return
 
