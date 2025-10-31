@@ -13,13 +13,12 @@ from qt_gui import MainWindow, Camera, Microphone, Worker, ScreenCapturer
 from constants import *
 
 IP = socket.gethostbyname(socket.gethostname())
-# IP = "192.168.12.1"
 VIDEO_ADDR = (IP, VIDEO_PORT)
 AUDIO_ADDR = (IP, AUDIO_PORT)
 
 
 class Client:
-    def __init__(self, name: str, current_device = False):
+    def __init__(self, name: str, current_device=False):
         self.name = name
         self.current_device = current_device
 
@@ -35,7 +34,7 @@ class Client:
             self.camera = None
             self.microphone = None
             self.screen_capturer = None
-        
+
         self.camera_enabled = True
         self.microphone_enabled = True
         self.screen_sharing = False
@@ -47,9 +46,8 @@ class Client:
 
         if self.camera is not None:
             self.video_frame = self.camera.get_frame()
-
         return self.video_frame
-    
+
     def get_audio(self):
         if not self.microphone_enabled:
             self.audio_data = None
@@ -57,7 +55,6 @@ class Client:
 
         if self.microphone is not None:
             self.audio_data = self.microphone.get_data()
-
         return self.audio_data
 
     def get_screen(self):
@@ -77,31 +74,36 @@ class ServerConnection(QThread):
     screen_update_signal = pyqtSignal(bytes)
     screen_share_reject_signal = pyqtSignal()
 
-    # New signals to communicate file-related info to UI
-    files_list_signal = pyqtSignal(list)  # emits list of file metadata
-    start_download_signal = pyqtSignal(str, str, int, str)  # transfer_id, filename, size, from_name
-    download_chunk_signal = pyqtSignal(str, bytes)  # transfer_id, chunk
-    finish_download_signal = pyqtSignal(str)  # transfer_id
+    # New: repopulate chat on-demand (list of (from_name, msg) tuples)
+    repopulate_chat_signal = pyqtSignal(list)
 
-    # --- NEW: upload signals for sender-side UI ---
-    start_upload_signal = pyqtSignal(str, str, int, tuple)   # upload_id, filename, total_bytes, to_names
-    upload_progress_signal = pyqtSignal(str, int)           # upload_id, percent (0-100)
-    finish_upload_signal = pyqtSignal(str)                  # upload_id
-# --------------------------------------------------------------------
+    # File-related signals
+    files_list_signal = pyqtSignal(list)
+    start_download_signal = pyqtSignal(str, str, int, str)
+    download_chunk_signal = pyqtSignal(str, bytes)
+    finish_download_signal = pyqtSignal(str)
 
-    
+    # Upload signals
+    start_upload_signal = pyqtSignal(str, str, int, tuple)
+    upload_progress_signal = pyqtSignal(str, int)
+    finish_upload_signal = pyqtSignal(str)
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.threadpool = None
-        self.name = None  # Set after login
+        self.name = None
+        self.connected = False
+        self.recieving_filename = None
+        self.screen_broadcast_thread = None
 
         self.main_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.video_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.audio_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
 
-        self.connected = False
-        self.recieving_filename = None
-        self.screen_broadcast_thread = None
+        # persistent message history
+        self.message_history = []  # list of tuples: (from_name, msg_text)
+
+    # ---------------- Connection ---------------- #
 
     def run(self):
         self.init_conn()
@@ -110,18 +112,17 @@ class ServerConnection(QThread):
         self.threadpool = QThreadPool()
         self.start_conn_threads()
         self.start_broadcast_threads()
-
         self.add_client_signal.emit(client)
 
         while self.connected:
-            time.sleep(0.1)  # Prevent tight loop
+            time.sleep(0.1)
         self.disconnect_server()
 
     def init_conn(self):
         try:
             self.main_socket.connect((IP, MAIN_PORT))
-
             self.main_socket.send_bytes(self.name.encode())
+
             conn_status = self.main_socket.recv_bytes().decode()
             if conn_status != OK:
                 QMessageBox.critical(None, "Error", conn_status)
@@ -129,41 +130,28 @@ class ServerConnection(QThread):
                 window.close()
                 self.connected = False
                 return
-            
+
             self.send_msg(self.video_socket, Message(self.name, ADD, VIDEO))
             self.send_msg(self.audio_socket, Message(self.name, ADD, AUDIO))
-
             self.connected = True
+
         except Exception as e:
             print(f"[ERROR] Connection failed: {e}")
             self.connected = False
-    
-    def start_conn_threads(self):
-        self.main_conn_thread = Worker(self.handle_conn, self.main_socket, TEXT)
-        self.threadpool.start(self.main_conn_thread)
 
-        self.video_conn_thread = Worker(self.handle_conn, self.video_socket, VIDEO)
-        self.threadpool.start(self.video_conn_thread)
-
-        self.audio_conn_thread = Worker(self.handle_conn, self.audio_socket, AUDIO)
-        self.threadpool.start(self.audio_conn_thread)
-
-    def start_broadcast_threads(self):
-        self.video_broadcast_thread = Worker(self.media_broadcast_loop, self.video_socket, VIDEO)
-        self.threadpool.start(self.video_broadcast_thread)
-
-        self.audio_broadcast_thread = Worker(self.media_broadcast_loop, self.audio_socket, AUDIO)
-        self.threadpool.start(self.audio_broadcast_thread)
-    
     def disconnect_server(self):
         if self.connected:
-            self.send_msg(self.main_socket, Message(self.name, DISCONNECT))
-            self.main_socket.disconnect()
+            try:
+                self.send_msg(self.main_socket, Message(self.name, DISCONNECT))
+                self.main_socket.disconnect()
+            except Exception:
+                pass
         self.connected = False
-    
+
+    # ---------------- Message sending ---------------- #
+
     def send_msg(self, conn: socket.socket, msg: Message):
         msg_bytes = pickle.dumps(msg)
-        # print("Sending..", len(msg_bytes))
         try:
             if msg.data_type == VIDEO:
                 conn.sendto(msg_bytes, VIDEO_ADDR)
@@ -174,71 +162,22 @@ class ServerConnection(QThread):
         except (BrokenPipeError, ConnectionResetError, OSError):
             print(f"[ERROR] Connection not present")
             self.connected = False
-    
-    def send_file(self, filepath: str, to_names: tuple[str]):
-        """Send a file to server (server stores and makes available to recipients)"""
-        import time
-        if not os.path.exists(filepath):
-            self.add_msg_signal.emit(self.name, f"File not found: {filepath}")
-            return
 
-        filename = os.path.basename(filepath)
-        filesize = os.path.getsize(filepath)
-        upload_id = f"upload_{filename}_{int(time.time()*1000)}"
+    # ---------------- Broadcasting ---------------- #
 
-        # Notify server of filename start
-        self.send_msg(self.main_socket, Message(self.name, POST, FILE, filename, to_names))
-        try:
-            self.start_upload_signal.emit(upload_id, filename, filesize, to_names)
-        except Exception:
-            pass
+    def start_conn_threads(self):
+        self.main_conn_thread = Worker(self.handle_conn, self.main_socket, TEXT)
+        self.threadpool.start(self.main_conn_thread)
+        self.video_conn_thread = Worker(self.handle_conn, self.video_socket, VIDEO)
+        self.threadpool.start(self.video_conn_thread)
+        self.audio_conn_thread = Worker(self.handle_conn, self.audio_socket, AUDIO)
+        self.threadpool.start(self.audio_conn_thread)
 
-        total_sent = 0
-        last_percent = -1
-
-        try:
-            with open(filepath, "rb") as f:
-                while True:
-                    data = f.read(SIZE)
-                    if not data:
-                        break
-
-                    msg = Message(self.name, POST, FILE, data, to_names)
-                    self.send_msg(self.main_socket, msg)
-
-                    total_sent += len(data)
-                    percent = int((total_sent * 100) / (filesize or 1))
-                    if percent != last_percent:
-                        self.upload_progress_signal.emit(upload_id, percent)
-                        last_percent = percent
-
-                    time.sleep(0.001)  # Prevent flooding
-
-            # Send end marker
-            self.send_msg(self.main_socket, Message(self.name, POST, FILE, None, to_names))
-
-            self.finish_upload_signal.emit(upload_id)
-            self.add_msg_signal.emit(self.name, f"File '{filename}' uploaded successfully ({filesize} bytes).")
-
-        except Exception as e:
-            self.add_msg_signal.emit(self.name, f"[ERROR] Upload failed: {e}")
-            try:
-                self.finish_upload_signal.emit(upload_id)
-            except Exception:
-                pass
-
-
-
-
-    def request_file_list(self):
-        """Ask server for files available for this client"""
-        msg = Message(self.name, GET_FILES)
-        self.send_msg(self.main_socket, msg)
-
-    def request_download(self, transfer_id: str):
-        """Ask server to stream the file with transfer_id to this client"""
-        msg = Message(self.name, DOWNLOAD_FILE, FILE, {"transfer_id": transfer_id})
-        self.send_msg(self.main_socket, msg)
+    def start_broadcast_threads(self):
+        self.video_broadcast_thread = Worker(self.media_broadcast_loop, self.video_socket, VIDEO)
+        self.threadpool.start(self.video_broadcast_thread)
+        self.audio_broadcast_thread = Worker(self.media_broadcast_loop, self.audio_socket, AUDIO)
+        self.threadpool.start(self.audio_broadcast_thread)
 
     def media_broadcast_loop(self, conn: socket.socket, media: str):
         while self.connected:
@@ -250,11 +189,59 @@ class ServerConnection(QThread):
                 print(f"[ERROR] Invalid media type")
                 break
             if data is None:
-                time.sleep(1/30)
+                time.sleep(1 / 30)
                 continue
             msg = Message(self.name, POST, media, data)
             self.send_msg(conn, msg)
-            time.sleep(1/30)  # ~30 FPS for video/audio
+            time.sleep(1 / 30)
+
+    # ---------------- File handling ---------------- #
+
+    def send_file(self, filepath: str, to_names: tuple[str]):
+        """Send a file to server (server stores and makes available to recipients)."""
+        if not os.path.exists(filepath):
+            self._record_and_emit_msg(self.name, f"File not found: {filepath}")
+            return
+
+        filename = os.path.basename(filepath)
+        filesize = os.path.getsize(filepath)
+        upload_id = f"upload_{filename}_{int(time.time() * 1000)}"
+        self.send_msg(self.main_socket, Message(self.name, POST, FILE, filename, to_names))
+        self.start_upload_signal.emit(upload_id, filename, filesize, to_names)
+
+        total_sent = 0
+        last_percent = -1
+        try:
+            with open(filepath, "rb") as f:
+                while True:
+                    data = f.read(SIZE)
+                    if not data:
+                        break
+                    msg = Message(self.name, POST, FILE, data, to_names)
+                    self.send_msg(self.main_socket, msg)
+
+                    total_sent += len(data)
+                    percent = int((total_sent * 100) / (filesize or 1))
+                    if percent != last_percent:
+                        self.upload_progress_signal.emit(upload_id, percent)
+                        last_percent = percent
+                    time.sleep(0.001)
+
+            self.send_msg(self.main_socket, Message(self.name, POST, FILE, None, to_names))
+            self.finish_upload_signal.emit(upload_id)
+            self._record_and_emit_msg(self.name, f"File '{filename}' uploaded successfully ({filesize} bytes).")
+
+        except Exception as e:
+            self._record_and_emit_msg(self.name, f"[ERROR] Upload failed: {e}")
+            self.finish_upload_signal.emit(upload_id)
+
+    def request_file_list(self):
+        self.send_msg(self.main_socket, Message(self.name, GET_FILES))
+
+    def request_download(self, transfer_id: str):
+        self.send_msg(self.main_socket, Message(self.name, DOWNLOAD_FILE, FILE, {"transfer_id": transfer_id}))
+
+    # ---------------- Connection handling ---------------- #
 
     def handle_conn(self, conn: socket.socket, media: str):
         while self.connected:
@@ -270,7 +257,6 @@ class ServerConnection(QThread):
             except pickle.UnpicklingError:
                 print(f"[{self.name}] [{media}] [ERROR] UnpicklingError")
                 continue
-
             if msg.request == DISCONNECT:
                 self.connected = False
                 break
@@ -280,60 +266,43 @@ class ServerConnection(QThread):
                 print(f"[{self.name}] [{media}] [ERROR] {e}")
                 continue
 
+    # ---------------- Message processing ---------------- #
+
     def handle_msg(self, msg: Message):
         global all_clients
         client_name = msg.from_name
+
         if msg.request == POST:
             if msg.data_type == TEXT and client_name == SERVER:
                 if msg.data == "Screen sharing already active by another user":
                     self.screen_share_reject_signal.emit()
                     return
+
             if client_name not in all_clients:
-                if msg.data_type in [VIDEO, AUDIO]:
-                    all_clients[client_name] = Client(client_name)
-                    self.add_client_signal.emit(all_clients[client_name])
-                else:
-                    # treat non-media messages from new senders as creating a client entry
-                    all_clients[client_name] = Client(client_name)
-                    self.add_client_signal.emit(all_clients[client_name])
+                all_clients[client_name] = Client(client_name)
+                self.add_client_signal.emit(all_clients[client_name])
+
             if msg.data_type == VIDEO:
                 all_clients[client_name].video_frame = msg.data
             elif msg.data_type == AUDIO:
                 all_clients[client_name].audio_data = msg.data
             elif msg.data_type == SCREEN:
                 self.screen_update_signal.emit(msg.data)
-            if msg.data_type == TEXT:
-                # special status update (camera / microphone) sent as dict
+            elif msg.data_type == TEXT:
                 if isinstance(msg.data, dict):
                     status = msg.data
-                    # ensure client exists
-                    if client_name not in all_clients:
-                        all_clients[client_name] = Client(client_name)
-                        self.add_client_signal.emit(all_clients[client_name])
                     c = all_clients[client_name]
-                    if 'camera_enabled' in status:
-                        c.camera_enabled = bool(status['camera_enabled'])
-                        # if camera is off, clear last frame
+                    if "camera_enabled" in status:
+                        c.camera_enabled = bool(status["camera_enabled"])
                         if not c.camera_enabled:
                             c.video_frame = None
-                    if 'microphone_enabled' in status:
-                        c.microphone_enabled = bool(status['microphone_enabled'])
+                    if "microphone_enabled" in status:
+                        c.microphone_enabled = bool(status["microphone_enabled"])
                         if not c.microphone_enabled:
                             c.audio_data = None
-                    # optionally show a small system message
-                    self.add_msg_signal.emit(client_name, f"Status updated: {status}")
+                    self._record_and_emit_msg(client_name, f"Status updated: {status}")
                 else:
-                    # legacy / regular chat text
-                    self.add_msg_signal.emit(client_name, msg.data)
-
-            elif msg.data_type == FILE and msg.request == POST:
-                # Deprecated: peer-to-peer direct file sending.
-                # Skip to avoid duplicate empty file creation.
-                return
-
-            else:
-                # Unknown data_type for POST
-                pass
+                    self._record_and_emit_msg(client_name, msg.data)
 
         elif msg.request == ADD:
             if client_name not in all_clients:
@@ -342,7 +311,6 @@ class ServerConnection(QThread):
 
         elif msg.request == RM:
             if client_name not in all_clients:
-                print(f"[{self.name}] [ERROR] Invalid client name {client_name}")
                 return
             self.remove_client_signal.emit(client_name)
             all_clients.pop(client_name)
@@ -351,76 +319,74 @@ class ServerConnection(QThread):
             self.screen_share_start_signal.emit(msg.data)
 
         elif msg.request == STOP_SHARE:
+            # normal stop event
             self.screen_share_stop_signal.emit()
 
-        # NEW: server responds with a FILE_LIST (list of files available for this client)
+            # defensive fix: repopulate chat in case the UI cleared on other clients
+            try:
+                hist_copy = list(self.message_history)
+                self.repopulate_chat_signal.emit(hist_copy)
+            except Exception as e:
+                print(f"[DEBUG] Failed to emit repopulate chat: {e}")
+
         elif msg.request == FILE_LIST and msg.data_type == FILE:
-            # msg.data is a list of dict metadata
             file_list = msg.data if isinstance(msg.data, list) else []
-            # forward to UI
             self.files_list_signal.emit(file_list)
 
         elif msg.request == FILE_CHUNK and msg.data_type == FILE:
-                # Track current active transfer id across chunk stream
-                if not hasattr(self, "_current_download_id"):
-                    self._current_download_id = None
+            if not hasattr(self, "_current_download_id"):
+                self._current_download_id = None
 
-                if isinstance(msg.data, dict):
-                    # Start of new file stream
-                    meta = msg.data
-                    transfer_id = meta.get("transfer_id")
-                    filename = meta.get("filename")
-                    size = meta.get("size", 0)
-                    from_name = meta.get("from", "")
-                    self._current_download_id = transfer_id
-                    self.start_download_signal.emit(transfer_id, filename, size, from_name)
+            if isinstance(msg.data, dict):
+                meta = msg.data
+                transfer_id = meta.get("transfer_id")
+                filename = meta.get("filename")
+                size = meta.get("size", 0)
+                from_name = meta.get("from", "")
+                self._current_download_id = transfer_id
+                self.start_download_signal.emit(transfer_id, filename, size, from_name)
 
-                elif msg.data is None:
-                    # End of file stream
-                    if self._current_download_id:
-                        self.finish_download_signal.emit(self._current_download_id)
-                    self._current_download_id = None
+            elif msg.data is None:
+                if self._current_download_id:
+                    self.finish_download_signal.emit(self._current_download_id)
+                self._current_download_id = None
 
-                else:
-                    # File data chunk
-                    if getattr(self, "_current_download_id", None):
-                        self.download_chunk_signal.emit(self._current_download_id, msg.data)
-
-
-        elif msg.request == GET_FILES:
-            # not expected from server to client
-            pass
-
-        elif msg.request == DOWNLOAD_FILE:
-            # not expected from server to client
-            pass
-
-        elif msg.request == START_SHARE:
-            # duplicate handling guard
-            pass
-
-        else:
-            # any other messages from server (text notifications)
-            if msg.data_type == TEXT and msg.from_name == SERVER:
-                self.add_msg_signal.emit("System", str(msg.data))
             else:
-                # fallback: emit text
-                try:
-                    self.add_msg_signal.emit(msg.from_name, str(msg.data))
-                except Exception:
-                    pass
+                if getattr(self, "_current_download_id", None):
+                    self.download_chunk_signal.emit(self._current_download_id, msg.data)
+
+    # ---------------- Helper methods ---------------- #
+
+    def _record_and_emit_msg(self, from_name: str, msg_text: str):
+        """Record messages into history and emit to UI."""
+        try:
+            MAX_HISTORY = 5000
+            self.message_history.append((from_name, msg_text))
+            if len(self.message_history) > MAX_HISTORY:
+                self.message_history.pop(0)
+        except Exception:
+            pass
+        try:
+            self.add_msg_signal.emit(from_name, msg_text)
+        except Exception:
+            pass
+
 
 client = Client("You", current_device=True)
-
 all_clients = defaultdict(lambda: Client(""))
 
 if __name__ == "__main__":
     app = QApplication(sys.argv)
-
     server_conn = ServerConnection()
     window = MainWindow(client, server_conn)
-    window.show()
 
+    # connect repopulate signal to window handler
+    try:
+        server_conn.repopulate_chat_signal.connect(window.repopulate_chat)
+    except Exception:
+        pass
+
+    window.show()
     status_code = app.exec()
     server_conn.disconnect_server()
     os._exit(status_code)
