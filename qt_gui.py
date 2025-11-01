@@ -10,7 +10,7 @@ from PyQt6.QtWidgets import QMainWindow, QVBoxLayout, QHBoxLayout, QGridLayout, 
     , QLabel, QWidget, QListWidget, QListWidgetItem, QMessageBox \
     , QComboBox, QTextEdit, QLineEdit, QPushButton, QFileDialog \
     , QDialog, QMenu, QWidgetAction, QCheckBox, QStyleFactory, QGraphicsDropShadowEffect \
-    , QSpacerItem, QSizePolicy, QProgressBar, QMenuBar, QToolButton,QInputDialog
+    , QSpacerItem, QSizePolicy, QProgressBar, QMenuBar, QToolButton,QInputDialog,QApplication
 
 from constants import *
 
@@ -425,36 +425,100 @@ class ScreenShareWidget(QWidget):
         self.setMaximumHeight(total)
 
     def toggle_maximize(self):
-        """Toggle maximize/restore while staying in layout and keeping fixed width."""
-        if not self.maximized:
-            # --- MAXIMIZE: only vertical expansion ---
-            # capture current width so it doesn't stretch horizontally
-            self.fixed_width = self.width()
-            self.setFixedWidth(self.fixed_width)
+        """Open a flexible, resizable window showing the shared screen."""
+        from PyQt6.QtWidgets import QDialog, QVBoxLayout, QLabel, QPushButton, QApplication
+        from PyQt6.QtGui import QPixmap, QIcon
+        from PyQt6.QtCore import Qt, QSize
 
-            self.set_maximized_height()
-            self.max_btn.setIcon(QIcon("img/restore.png"))
-            self.max_btn.setToolTip("Restore to minimized height")
-            self.maximized = True
+        # If already open, bring it to front
+        if hasattr(self, "screen_window") and self.screen_window is not None:
+            if self.screen_window.isVisible():
+                self.screen_window.raise_()
+                self.screen_window.activateWindow()
+                return
 
-        else:
-            # --- RESTORE: unlock width, go back to minimized height ---
-            if hasattr(self, "fixed_width"):
-                # allow layout to manage width again
-                self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-                self.setMinimumWidth(0)
-                self.setMaximumWidth(16777215)
+        # --- Create resizable floating dialog ---
+        self.screen_window = QDialog(self)
+        self.screen_window.setWindowTitle("Screen Share View")
+        self.screen_window.setWindowFlag(Qt.WindowType.Window)
+        self.screen_window.setWindowModality(Qt.WindowModality.NonModal)
+        self.screen_window.setStyleSheet("background-color: black; border: 2px solid #89b4fa;")
+        self.screen_window.resize(1000, 650)
+        self.screen_window.setMinimumSize(500, 350)
+        self.screen_window.setSizeGripEnabled(True)  # allows user resize
 
-            self.set_minimized_height()
-            self.max_btn.setIcon(QIcon("img/maximise.png"))
-            self.max_btn.setToolTip("Maximize vertically")
-            self.maximized = False
+        # Layout
+        layout = QVBoxLayout(self.screen_window)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
 
-        # relayout parent cleanly
-        if self.parent() and hasattr(self.parent(), "layout"):
-            parent_layout = self.parent().layout()
-            parent_layout.invalidate()
-            parent_layout.update()
+        # --- Image Label ---
+        self.screen_label = QLabel()
+        self.screen_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.screen_label, 1)
+
+        # --- Restore icon button ---
+        restore_btn = QPushButton(self.screen_window)
+        restore_btn.setIcon(QIcon("img/restore.png"))
+        restore_btn.setIconSize(QSize(28, 28))
+        restore_btn.setFixedSize(40, 40)
+        restore_btn.setToolTip("Close Window")
+        restore_btn.setStyleSheet("""
+            QPushButton {
+                background-color: rgba(255,255,255,0.2);
+                border: none;
+                border-radius: 6px;
+            }
+            QPushButton:hover {
+                background-color: rgba(255,255,255,0.4);
+            }
+        """)
+        restore_btn.clicked.connect(self.screen_window.close)
+
+        # Position top-right corner
+        def reposition():
+            margin = 15
+            restore_btn.move(self.screen_window.width() - restore_btn.width() - margin, margin)
+        self.screen_window.resizeEvent = lambda e: reposition()
+
+        # Cleanup on close
+        def on_close():
+            self.screen_window = None
+        self.screen_window.finished.connect(on_close)
+
+        # --- Show current image if available ---
+        if hasattr(self, "last_image_bytes") and self.last_image_bytes:
+            self._update_screen_window_image(self.last_image_bytes)
+
+        # Show window
+        self.screen_window.show()
+        reposition()
+        QApplication.processEvents()
+
+    def _update_screen_window_image(self, image_bytes: bytes):
+        """Continuously update the flexible screen window with latest frame."""
+        if not hasattr(self, "screen_window") or self.screen_window is None:
+            return
+        if not image_bytes:
+            return
+        try:
+            image = cv2.imdecode(np.frombuffer(image_bytes, np.uint8), cv2.IMREAD_COLOR)
+            if image is None:
+                return
+            image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+            h, w, ch = image.shape
+            q_img = QImage(image.data, w, h, ch * w, QImage.Format.Format_RGB888)
+            pixmap = QPixmap.fromImage(q_img)
+            pixmap = pixmap.scaled(
+                self.screen_window.width(),
+                self.screen_window.height(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation
+            )
+            self.screen_label.setPixmap(pixmap)
+        except Exception as e:
+            print(f"[Screen Window Update Error] {e}")
+
 
 
     def show_share(self, presenter_name, image_bytes, is_presenter=False):
@@ -470,6 +534,7 @@ class ScreenShareWidget(QWidget):
             self.screen_viewer.setText("Your screen is being shared...")
             self.screen_viewer.setStyleSheet("color: #a6e3a1; background-color: #000; border-radius: 12px;")
             self.max_btn.hide()
+            self.set_minimized_height(0.5)  # ensure presenter view takes only half screen
             return
 
         # show button if not presenter
@@ -492,6 +557,12 @@ class ScreenShareWidget(QWidget):
                     )
                     self.screen_viewer.setPixmap(pixmap)
                     self.last_image_bytes = image_bytes
+                    # if fullscreen active, update that too
+                    # Update flexible screen window if open
+                    if hasattr(self, "screen_window") and self.screen_window is not None:
+                        self._update_screen_window_image(image_bytes)
+
+
                     return
             except Exception as e:
                 print(f"[ScreenShareWidget] Failed to render image: {e}")
@@ -1396,10 +1467,30 @@ class MainWindow(QMainWindow):
             self.screen_timer.stop()
             self.screen_share_active = False
 
-        # Reset button for everyone
+        # Reset sharing flags
         self.other_sharing = False
-        self.chat_widget.share_button.setText("Share Screen")
-        self.chat_widget.share_button.setEnabled(True)
+
+        # Re-enable ALL chat control buttons
+        if hasattr(self, "chat_widget"):
+            self.chat_widget.share_button.setText("Share Screen")
+            self.chat_widget.share_button.setEnabled(True)
+
+            # Re-enable chat control buttons
+            if hasattr(self.chat_widget, "send_button"):
+                self.chat_widget.send_button.setEnabled(True)
+                self.chat_widget.send_button.show()
+            if hasattr(self.chat_widget, "file_button"):
+                self.chat_widget.file_button.setEnabled(True)
+                self.chat_widget.file_button.show()
+            if hasattr(self.chat_widget, "download_button"):
+                self.chat_widget.download_button.setEnabled(True)
+                self.chat_widget.download_button.show()
+
+            # Re-enable the text input field
+            if hasattr(self.chat_widget, "input_box"):
+                self.chat_widget.input_box.setEnabled(True)
+                self.chat_widget.input_box.show()
+
 
 
     def on_screen_share_reject(self):
