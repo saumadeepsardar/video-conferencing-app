@@ -4,6 +4,7 @@ import pyaudio
 import mss
 import numpy as np
 import sys
+import time
 from PyQt6.QtCore import Qt, QThread, QTimer, QSize, QRunnable, pyqtSlot, QPropertyAnimation, QEasingCurve, QEvent
 from PyQt6.QtGui import QImage, QPixmap, QActionGroup, QIcon, QFont, QAction
 from PyQt6.QtWidgets import QMainWindow, QVBoxLayout, QHBoxLayout, QGridLayout, QDockWidget \
@@ -242,16 +243,16 @@ class AudioThread(QThread):
         self.connected = True
 
     def run(self):
-        if self.client.microphone is not None:
-            return
+        # This thread is for playing audio from OTHER clients, not our own microphone
         while self.connected:
             self.update_audio()
+            time.sleep(0.01)  # Small delay to prevent tight loop
 
     def update_audio(self):
-        data = self.client.get_audio()
-        if data is not None and self.stream is not None:
+        # Play audio data from this client (received from server)
+        if hasattr(self.client, 'audio_data') and self.client.audio_data is not None and self.stream is not None:
             try:
-                self.stream.write(data)
+                self.stream.write(self.client.audio_data)
             except Exception as e:
                 print(f"[ERROR] Audio playback failed: {e}")
 
@@ -259,26 +260,72 @@ class AudioThread(QThread):
 class Camera:
     def __init__(self):
         self.cap = None
-        for index in range(3):
-            cap = cv2.VideoCapture(index)
-            if cap.isOpened():
-                self.cap = cap
-                print(f"[INFO] Camera found at index {index}")
-                break
-        if self.cap is None:
-            print("[ERROR] No camera found at indices 0-2")
+        self.camera_detected = False
+        self.error_logged = False
+        
+        # Suppress OpenCV warnings
+        import logging
+        logging.getLogger('opencv').setLevel(logging.ERROR)
+        
+        # Try different camera backends for better compatibility
+        backends = [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY]
+        
+        for backend in backends:
+            for index in range(3):
+                try:
+                    cap = cv2.VideoCapture(index, backend)
+                    if cap.isOpened():
+                        # Test if we can actually read a frame
+                        ret, test_frame = cap.read()
+                        if ret and test_frame is not None:
+                            self.cap = cap
+                            self.camera_detected = True
+                            print("Camera detected")
+                            # Set camera properties for better performance
+                            self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                            self.cap.set(cv2.CAP_PROP_FPS, 30)
+                            return
+                        else:
+                            cap.release()
+                except Exception:
+                    if cap:
+                        cap.release()
+                    continue
+        
+        if not self.camera_detected and not self.error_logged:
+            print("Camera not detected")
+            self.error_logged = True
 
     def get_frame(self):
-        if self.cap is None:
+        if not self.camera_detected or self.cap is None:
             return None
-        ret, frame = self.cap.read()
-        if ret:
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            frame = cv2.resize(frame, frame_size[CAMERA_RES], interpolation=cv2.INTER_AREA)
-            if ENABLE_ENCODE:
-                _, frame = cv2.imencode('.jpg', frame, ENCODE_PARAM)
-            return frame
-        return None
+            
+        try:
+            ret, frame = self.cap.read()
+            if ret and frame is not None:
+                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                frame = cv2.resize(frame, frame_size[CAMERA_RES], interpolation=cv2.INTER_AREA)
+                if ENABLE_ENCODE:
+                    _, frame = cv2.imencode('.jpg', frame, ENCODE_PARAM)
+                return frame
+            else:
+                return None
+        except Exception:
+            return None
+    
+    def release(self):
+        """Release camera resources"""
+        if self.cap is not None:
+            try:
+                self.cap.release()
+                self.cap = None
+                self.camera_detected = False
+            except Exception:
+                pass
+    
+    def __del__(self):
+        """Destructor to ensure camera is released"""
+        self.release()
 
 
 class ScreenCapturer:
@@ -332,27 +379,54 @@ class VideoWidget(QWidget):
         self.setLayout(self.layout)
     
     def init_video(self):
-        # Improved FPS for better camera quality (60 FPS)
-        self.timer.start(16)  # ~60 FPS (1000ms / 60 = 16.67ms)
+        # 30 FPS for better stability and performance
+        self.timer.start(33)  # ~30 FPS (1000ms / 30 = 33.33ms)
     
     def update_video(self):
-        frame = self.client.get_video()
-        if frame is None:
-            frame = NOCAM_FRAME.copy()
-        elif ENABLE_ENCODE:
-            frame = cv2.imdecode(frame, cv2.IMREAD_COLOR)
-        
-        frame = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT), interpolation=cv2.INTER_AREA)
-        
-        if self.client.audio_data is None:
-            nomic_h, nomic_w, _ = NOMIC_FRAME.shape
-            x, y = FRAME_WIDTH//2 - nomic_w//2, FRAME_HEIGHT - 50
-            frame[y:y+nomic_h, x:x+nomic_w] = NOMIC_FRAME.copy()
+        try:
+            frame = self.client.get_video()
+            if frame is None:
+                frame = NOCAM_FRAME.copy()
+            elif ENABLE_ENCODE and isinstance(frame, (bytes, bytearray, np.ndarray)):
+                try:
+                    if isinstance(frame, (bytes, bytearray)):
+                        frame = cv2.imdecode(np.frombuffer(frame, np.uint8), cv2.IMREAD_COLOR)
+                    elif isinstance(frame, np.ndarray) and len(frame.shape) == 1:
+                        frame = cv2.imdecode(frame, cv2.IMREAD_COLOR)
+                except Exception:
+                    frame = NOCAM_FRAME.copy()
+            
+            if frame is None:
+                frame = NOCAM_FRAME.copy()
+                
+            frame = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT), interpolation=cv2.INTER_AREA)
+            
+            # Add microphone indicator if audio is disabled
+            if hasattr(self.client, 'audio_data') and self.client.audio_data is None:
+                try:
+                    nomic_h, nomic_w, _ = NOMIC_FRAME.shape
+                    x, y = FRAME_WIDTH//2 - nomic_w//2, FRAME_HEIGHT - 50
+                    if y >= 0 and x >= 0 and y + nomic_h <= FRAME_HEIGHT and x + nomic_w <= FRAME_WIDTH:
+                        frame[y:y+nomic_h, x:x+nomic_w] = NOMIC_FRAME.copy()
+                except Exception:
+                    pass  # Skip microphone indicator if there's an error
 
-        h, w, ch = frame.shape
-        bytes_per_line = ch * w
-        q_img = QImage(frame.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
-        self.video_viewer.setPixmap(QPixmap.fromImage(q_img))
+            h, w, ch = frame.shape
+            bytes_per_line = ch * w
+            q_img = QImage(frame.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+            self.video_viewer.setPixmap(QPixmap.fromImage(q_img))
+            
+        except Exception:
+            # Fallback to no camera frame on any error
+            try:
+                frame = NOCAM_FRAME.copy()
+                frame = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT), interpolation=cv2.INTER_AREA)
+                h, w, ch = frame.shape
+                bytes_per_line = ch * w
+                q_img = QImage(frame.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
+                self.video_viewer.setPixmap(QPixmap.fromImage(q_img))
+            except Exception:
+                pass  # If even the fallback fails, just skip this frame
 
 
 class ScreenShareWidget(QWidget):
@@ -1299,6 +1373,8 @@ class MainWindow(QMainWindow):
         if not self.login_dialog.exec():
             exit()
         
+        # Set server IP and name from login dialog
+        self.server_conn.server_ip = self.login_dialog.get_ip()
         self.server_conn.name = self.login_dialog.get_name()
         self.client.name = self.server_conn.name
         self.server_conn.start()
