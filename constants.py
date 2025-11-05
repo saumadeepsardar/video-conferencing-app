@@ -44,8 +44,11 @@ def send_bytes(self, msg: bytes):
     try:
         packet = struct.pack('>I', len(msg)) + msg
         self.sendall(packet)
+    except (BrokenPipeError, ConnectionResetError, OSError):
+        # Connection closed, raise silently
+        raise
     except Exception as e:
-        print(f"[send_bytes ERROR] {e} at {time.strftime('%H:%M:%S')}")
+        print(f"[send_bytes ERROR] {e}")
         raise
 
 def recv_bytes(self):
@@ -63,8 +66,8 @@ def recvall(self, n):
     while len(data) < n:
         try:
             packet = self.recv(n - len(data))
-        except (BrokenPipeError, ConnectionResetError, OSError) as e:
-            print(f"[recvall ERROR] Connection not present: {e}")
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            # Connection closed, return empty bytes silently
             return b''
         if not packet:
             return b''
