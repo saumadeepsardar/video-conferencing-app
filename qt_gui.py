@@ -288,7 +288,7 @@ class Camera:
                         if ret and test_frame is not None:
                             self.cap = cap
                             self.camera_detected = True
-                            print("Camera detected")
+                            print(f"Camera detected on index {index} with backend {backend}")
                             # Set camera properties for better performance
                             self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                             self.cap.set(cv2.CAP_PROP_FPS, 30)
@@ -316,7 +316,7 @@ class Camera:
                 
                 if ENABLE_ENCODE:
                     # Keep frame in BGR for JPEG encoding (cross-platform compatibility)
-                    encode_param = [cv2.IMWRITE_JPEG_QUALITY, 85]
+                    encode_param = [cv2.IMWRITE_JPEG_QUALITY, 80]
                     success, encoded_frame = cv2.imencode('.jpg', frame, encode_param)
                     if success:
                         # Return as bytes for network transmission
@@ -405,6 +405,8 @@ class VideoWidget(QWidget):
     def update_video(self):
         try:
             frame = self.client.get_video()
+            
+            # Video display for client
             
             # Handle different frame types with better cross-platform compatibility
             if frame is None:

@@ -144,16 +144,32 @@ def media_server(media: str, port: int):
     conn.bind((IP, port))
     print(f"[LISTENING] {media} Server is listening on {IP}:{port}")
     while True:
-        msg_bytes, addr = conn.recvfrom(MEDIA_SIZE[media])
+        try:
+            msg_bytes, addr = conn.recvfrom(MEDIA_SIZE[media])
+        except OSError as e:
+            if "10040" in str(e) or "message larger than" in str(e).lower():
+                # Datagram too large, skip it
+                print(f"[{media}] Skipping oversized packet")
+                continue
+            else:
+                print(f"[{media}] Network error: {e}")
+                continue
+        except Exception as e:
+            print(f"[{media}] Receive error: {e}")
+            continue
+            
         try:
             msg: Message = pickle.loads(msg_bytes)
         except (pickle.UnpicklingError, pickle.PickleError, EOFError, ValueError) as e:
             print(f"[{addr}] [{media}] [ERROR] Pickle error: {e}")
             continue
+            
         if msg.request == ADD:
             client = clients[msg.from_name]
             client.media_addrs[media] = addr
+            pass  # Client registered
         else:
+            pass  # Broadcasting media
             broadcast_msg(msg.from_name, msg.request, msg.data_type, msg.data)
 
 def ensure_files_index_for(recipient: str):

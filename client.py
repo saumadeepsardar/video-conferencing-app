@@ -48,6 +48,7 @@ class Client:
         if self.camera is not None:
             try:
                 self.video_frame = self.camera.get_frame()
+                pass  # Video frame captured
             except Exception as e:
                 print(f"[ERROR] Failed to get video frame: {e}")
                 self.video_frame = None
@@ -61,6 +62,7 @@ class Client:
 
         if self.microphone is not None:
             self.audio_data = self.microphone.get_data()
+            pass  # Audio captured
 
         return self.audio_data
 
@@ -273,6 +275,7 @@ class ServerConnection(QThread):
                     
                 msg = Message(self.name, POST, media, data)
                 self.send_msg(conn, msg)
+                pass  # Media data sent
                 time.sleep(1/30)  # 30 FPS for better stability and bandwidth usage
                 
             except Exception as e:
@@ -323,9 +326,11 @@ class ServerConnection(QThread):
             if msg.data_type == VIDEO:
                 if client_name in all_clients:
                     all_clients[client_name].video_frame = msg.data
+                    pass  # Video received
             elif msg.data_type == AUDIO:
                 if client_name in all_clients:
                     all_clients[client_name].audio_data = msg.data
+                    pass  # Audio received
             elif msg.data_type == SCREEN:
                 self.screen_update_signal.emit(msg.data)
             if msg.data_type == TEXT:
