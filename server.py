@@ -115,11 +115,12 @@ class Client:
                 addr = self.media_addrs.get(data_type, None)
                 if addr is None:
                     return
-                media_conns[data_type].sendto(pickle.dumps(msg), addr)
+                # Use protocol 2 for better cross-platform compatibility
+                media_conns[data_type].sendto(pickle.dumps(msg, protocol=2), addr)
             else:
-                self.main_conn.send_bytes(pickle.dumps(msg))
-        except (BrokenPipeError, ConnectionResetError, OSError):
-            print(f"[{self.name}] [ERROR] BrokenPipeError or ConnectionResetError or OSError")
+                self.main_conn.send_bytes(pickle.dumps(msg, protocol=2))
+        except (BrokenPipeError, ConnectionResetError, OSError) as e:
+            print(f"[{self.name}] [ERROR] Connection error: {e}")
             self.connected = False
 
 def broadcast_msg(from_name: str, request: str, data_type: str = None, data: any = None):
@@ -146,8 +147,8 @@ def media_server(media: str, port: int):
         msg_bytes, addr = conn.recvfrom(MEDIA_SIZE[media])
         try:
             msg: Message = pickle.loads(msg_bytes)
-        except pickle.UnpicklingError:
-            print(f"[{addr}] [{media}] [ERROR] UnpicklingError")
+        except (pickle.UnpicklingError, pickle.PickleError, EOFError, ValueError) as e:
+            print(f"[{addr}] [{media}] [ERROR] Pickle error: {e}")
             continue
         if msg.request == ADD:
             client = clients[msg.from_name]
@@ -396,8 +397,8 @@ def handle_main_conn(name: str):
             break
         try:
             msg = pickle.loads(msg_bytes)
-        except pickle.UnpicklingError:
-            print(f"[{name}] [ERROR] UnpicklingError")
+        except (pickle.UnpicklingError, pickle.PickleError, EOFError, ValueError) as e:
+            print(f"[{name}] [ERROR] Pickle error: {e}")
             continue
 
 
