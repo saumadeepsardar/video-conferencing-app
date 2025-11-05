@@ -19,6 +19,60 @@ media_conns = {VIDEO: video_conn, AUDIO: audio_conn}
 DATA_DIR = "data"
 os.makedirs(DATA_DIR, exist_ok=True)
 
+def cleanup_empty_files():
+    """Remove any 0-byte files from the data directory"""
+    if not os.path.exists(DATA_DIR):
+        return
+    
+    for root, dirs, files in os.walk(DATA_DIR):
+        for file in files:
+            filepath = os.path.join(root, file)
+            try:
+                if os.path.getsize(filepath) == 0:
+                    os.remove(filepath)
+            except (OSError, FileNotFoundError):
+                pass
+
+def cleanup_duplicate_files():
+    """Remove duplicate files based on name, size, and content hash"""
+    if not os.path.exists(DATA_DIR):
+        return
+    
+    import hashlib
+    file_hashes = {}
+    
+    for root, dirs, files in os.walk(DATA_DIR):
+        for file in files:
+            filepath = os.path.join(root, file)
+            try:
+                if not os.path.exists(filepath) or os.path.getsize(filepath) == 0:
+                    continue
+                    
+                # Calculate file hash
+                with open(filepath, 'rb') as f:
+                    file_hash = hashlib.md5(f.read()).hexdigest()
+                
+                # Create a key based on filename and size
+                file_key = f"{file}_{os.path.getsize(filepath)}"
+                
+                if file_key in file_hashes:
+                    # Check if hash matches (same content)
+                    if file_hashes[file_key]['hash'] == file_hash:
+                        # Duplicate found, remove the newer file
+                        if os.path.getctime(filepath) > os.path.getctime(file_hashes[file_key]['path']):
+                            os.remove(filepath)
+                        else:
+                            os.remove(file_hashes[file_key]['path'])
+                            file_hashes[file_key] = {'path': filepath, 'hash': file_hash}
+                    else:
+                        # Same name/size but different content, keep both
+                        file_hashes[file_key] = {'path': filepath, 'hash': file_hash}
+                else:
+                    file_hashes[file_key] = {'path': filepath, 'hash': file_hash}
+                    
+            except (OSError, FileNotFoundError, PermissionError):
+                pass
+
 # Keep an index of saved files per recipient:
 # files_index[recipient] = list of dicts: { "transfer_id": str, "filename": str, "path": str, "size": int, "from": str, "timestamp": float }
 files_index: dict[str, list] = {}
@@ -98,7 +152,6 @@ def media_server(media: str, port: int):
         if msg.request == ADD:
             client = clients[msg.from_name]
             client.media_addrs[media] = addr
-            print(f"[{addr}] [{media}] {msg.from_name} added")
         else:
             broadcast_msg(msg.from_name, msg.request, msg.data_type, msg.data)
 
@@ -108,6 +161,23 @@ def ensure_files_index_for(recipient: str):
 
 def add_file_index(recipient: str, filename: str, path: str, size: int, from_name: str, transfer_id: str):
     ensure_files_index_for(recipient)
+    
+    # Check if this transfer_id already exists for this recipient to prevent duplicates
+    for existing in files_index[recipient]:
+        if existing["transfer_id"] == transfer_id and existing["filename"] == filename:
+            # Update existing entry instead of creating duplicate
+            existing["size"] = size
+            existing["timestamp"] = time.time()
+            existing["path"] = path  # Update path in case it changed
+            return
+    
+    # Also check for duplicate filenames with different transfer_ids (same file uploaded multiple times)
+    for existing in files_index[recipient]:
+        if existing["filename"] == filename and existing["from"] == from_name and existing["size"] == size:
+            # This looks like a duplicate file, don't add it
+            return
+    
+    # Add new entry only if it doesn't exist
     files_index[recipient].append({
         "transfer_id": transfer_id,
         "filename": filename,
@@ -151,23 +221,18 @@ def handle_file_post(msg: Message, from_name: str):
                 print(f"[ERROR] Could not open {path} for writing: {e}")
                 continue
             handles[r] = {"fileobj": fobj, "path": path, "filename": safe_name}
-            # add preliminary index entry so file appears early in recipient's list
-            add_file_index(r, safe_name, path, 0, from_name, transfer_id)
 
         # register this active transfer
         active_transfers[(from_name, filename, transfer_id)] = handles
-        print(f"[FILE] Starting transfer {transfer_id} from {from_name} -> {recipients}")
         return
 
     # --- CASE 2: safety guard: ignore stray chunks if no transfer started yet ---
     if not active_transfers:
-        print(f"[WARN] No active transfer yet for {from_name}, ignoring stray data")
         return
 
     # --- locate active transfer for this sender ---
     matched_keys = [k for k in active_transfers.keys() if k[0] == from_name]
     if not matched_keys:
-        print(f"[WARN] Received file data but no matching active transfer from {from_name}")
         return
 
     matched_keys.sort(key=lambda k: k[2], reverse=True)  # pick newest
@@ -183,27 +248,18 @@ def handle_file_post(msg: Message, from_name: str):
                 fobj.close()
 
                 if not valid_file(path):
-                    print(f"[WARN] Skipping empty or invalid file {path}")
                     if os.path.exists(path):
                         os.remove(path)
                     continue
 
                 size = os.path.getsize(path)
-                ensure_files_index_for(r)
-                updated = False
-                for entry in files_index[r]:
-                    if entry["transfer_id"] == transfer_key[2] and entry["filename"] == info["filename"]:
-                        entry["size"] = size
-                        updated = True
-                        break
-                if not updated:
-                    add_file_index(r, info["filename"], path, size, from_name, transfer_key[2])
+                # Add the completed file to the index
+                add_file_index(r, info["filename"], path, size, from_name, transfer_key[2])
 
             except Exception as e:
                 print(f"[ERROR] Closing file for {r}: {e}")
 
         active_transfers.pop(transfer_key, None)
-        print(f"[FILE] Completed transfer {transfer_key[2]} from {from_name}")
         return
 
     # --- CASE 4: file data chunk (bytes) ---
@@ -216,7 +272,7 @@ def handle_file_post(msg: Message, from_name: str):
         return
 
     # --- fallback: unexpected type ---
-    print(f"[WARN] Unexpected file data type from {from_name}: {type(msg.data)}")
+    pass
 
 
 def send_file_list_to(client_name: str):
@@ -226,6 +282,16 @@ def send_file_list_to(client_name: str):
     """
     ensure_files_index_for(client_name)
     entries = files_index.get(client_name, [])
+    
+    # Filter out 0-byte files and files that don't exist
+    valid_entries = []
+    for e in entries:
+        if e["size"] > 0 and valid_file(e["path"]):
+            valid_entries.append(e)
+    
+    # Update the index to only contain valid entries
+    files_index[client_name] = valid_entries
+    
     # make a shallow copy with only necessary fields
     send_list = [
         {
@@ -234,7 +300,7 @@ def send_file_list_to(client_name: str):
             "size": e["size"],
             "from": e["from"],
             "timestamp": e.get("timestamp", 0)
-        } for e in entries
+        } for e in valid_entries
     ]
     # send from SERVER
     if client_name in clients:
@@ -262,30 +328,42 @@ def handle_download_request(msg: Message, requester_name: str):
     path = entry["path"]
     filename = entry["filename"]
     size = entry["size"]
+    
+    # Validate file exists and has content before streaming
+    if not valid_file(path):
+        clients[requester_name].send_msg(SERVER, POST, TEXT, "Requested file is empty or corrupted")
+        return
+        
     # send a FILE_CHUNK metadata start message with size & filename
     metadata = {"transfer_id": transfer_id, "filename": filename, "size": size, "from": entry.get("from", "")}
     clients[requester_name].send_msg(SERVER, FILE_CHUNK, FILE, metadata)
+    
     # stream file in chunks
     try:
         with open(path, "rb") as f:
+            bytes_sent = 0
             while True:
                 chunk = f.read(SIZE)
                 if not chunk:
                     break
                 clients[requester_name].send_msg(SERVER, FILE_CHUNK, FILE, chunk)
+                bytes_sent += len(chunk)
                 # small sleep to avoid flooding
                 time.sleep(0.001)
+                
+        # Verify we sent the expected amount of data
+        if bytes_sent != size:
+            clients[requester_name].send_msg(SERVER, POST, TEXT, f"File transfer incomplete: sent {bytes_sent}/{size} bytes")
+            
     except Exception as e:
         print(f"[ERROR] Error while sending file {path} to {requester_name}: {e}")
         clients[requester_name].send_msg(SERVER, POST, TEXT, f"Error streaming file: {e}")
         return
     # send final None marker to indicate end
     clients[requester_name].send_msg(SERVER, FILE_CHUNK, FILE, None)
-    print(f"[FILE] Completed streaming {filename} ({transfer_id}) to {requester_name}")
 
 def disconnect_client(client: Client):
     global clients, current_presenter
-    print(f"[DISCONNECT] {client.name} disconnected from Main Server")
     if current_presenter == client.name:
         current_presenter = None
         broadcast_msg(SERVER, STOP_SHARE, SCREEN)
@@ -299,8 +377,6 @@ def disconnect_client(client: Client):
     try:
         clients.pop(client.name)
     except KeyError:
-        print(f"[ERROR] {client.name} not in clients")
-        print(clients)
         pass
 
 def handle_main_conn(name: str):
@@ -324,8 +400,7 @@ def handle_main_conn(name: str):
             print(f"[{name}] [ERROR] UnpicklingError")
             continue
 
-        # debug print can be useful
-        print(msg)
+
 
         if msg.request == DISCONNECT:
             break
@@ -338,7 +413,6 @@ def handle_main_conn(name: str):
                 clients[name].send_msg(SERVER, START_SHARE, SCREEN, data=name)
                 # broadcast to the rest that someone started sharing
                 broadcast_msg(SERVER, START_SHARE, SCREEN, data=name)
-                print(f"[SHARE] {name} started screen sharing")
             else:
                 # send rejection to requester only
                 clients[name].send_msg(SERVER, POST, TEXT, "Screen sharing already active by another user")
@@ -347,7 +421,6 @@ def handle_main_conn(name: str):
             if current_presenter == name:
                 current_presenter = None
                 broadcast_msg(SERVER, STOP_SHARE, SCREEN)
-                print(f"[SHARE] {name} stopped screen sharing")
             else:
                 clients[name].send_msg(SERVER, POST, TEXT, "You are not the current presenter")
 
@@ -400,16 +473,16 @@ def main_server():
             continue
         conn.send_bytes(OK.encode())
         clients[name] = Client(name, conn, True)
-        print(f"[NEW CONNECTION] {name} connected to Main Server")
         main_conn_thread = threading.Thread(target=handle_main_conn, args=(name,))
         main_conn_thread.start()
 
 if __name__ == "__main__":
     try:
+        # Clean up any leftover 0-byte files and duplicates from previous runs
+        cleanup_empty_files()
+        cleanup_duplicate_files()
         main_server()
     except KeyboardInterrupt:
-        print(traceback.format_exc())
-        print(f"[EXITING] Keyboard Interrupt")
         for client in list(clients.values()):
             disconnect_client(client)
     except Exception as e:
