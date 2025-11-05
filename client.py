@@ -163,7 +163,7 @@ class ServerConnection(QThread):
     
     def send_msg(self, conn: socket.socket, msg: Message):
         msg_bytes = pickle.dumps(msg)
-        # print("Sending..", len(msg_bytes))
+
         try:
             if msg.data_type == VIDEO:
                 conn.sendto(msg_bytes, VIDEO_ADDR)
@@ -247,14 +247,13 @@ class ServerConnection(QThread):
             elif media == AUDIO:
                 data = client.get_audio()
             else:
-                print(f"[ERROR] Invalid media type")
                 break
             if data is None:
-                time.sleep(1/30)
+                time.sleep(1/60)
                 continue
             msg = Message(self.name, POST, media, data)
             self.send_msg(conn, msg)
-            time.sleep(1/30)  # ~30 FPS for video/audio
+            time.sleep(1/60)  # Improved to ~60 FPS for better video quality
 
     def handle_conn(self, conn: socket.socket, media: str):
         while self.connected:
@@ -342,7 +341,6 @@ class ServerConnection(QThread):
 
         elif msg.request == RM:
             if client_name not in all_clients:
-                print(f"[{self.name}] [ERROR] Invalid client name {client_name}")
                 return
             self.remove_client_signal.emit(client_name)
             all_clients.pop(client_name)
