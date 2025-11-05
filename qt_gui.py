@@ -267,8 +267,16 @@ class Camera:
         import logging
         logging.getLogger('opencv').setLevel(logging.ERROR)
         
-        # Try different camera backends for better compatibility
-        backends = [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY]
+        # Try different camera backends for better cross-platform compatibility
+        import sys
+        if sys.platform.startswith('win'):
+            backends = [cv2.CAP_DSHOW, cv2.CAP_MSMF, cv2.CAP_ANY]
+        elif sys.platform.startswith('linux'):
+            backends = [cv2.CAP_V4L2, cv2.CAP_ANY]
+        elif sys.platform.startswith('darwin'):
+            backends = [cv2.CAP_AVFOUNDATION, cv2.CAP_ANY]
+        else:
+            backends = [cv2.CAP_ANY]
         
         for backend in backends:
             for index in range(3):
@@ -303,14 +311,26 @@ class Camera:
         try:
             ret, frame = self.cap.read()
             if ret and frame is not None:
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                # Resize first for better performance
                 frame = cv2.resize(frame, frame_size[CAMERA_RES], interpolation=cv2.INTER_AREA)
+                
                 if ENABLE_ENCODE:
-                    _, frame = cv2.imencode('.jpg', frame, ENCODE_PARAM)
-                return frame
+                    # Keep frame in BGR for JPEG encoding (cross-platform compatibility)
+                    encode_param = [cv2.IMWRITE_JPEG_QUALITY, 85]
+                    success, encoded_frame = cv2.imencode('.jpg', frame, encode_param)
+                    if success:
+                        # Return as bytes for network transmission
+                        return encoded_frame.tobytes()
+                    else:
+                        # Fallback: convert to RGB for display
+                        return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                else:
+                    # For unencoded frames, convert to RGB for display
+                    return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             else:
                 return None
-        except Exception:
+        except Exception as e:
+            print(f"[ERROR] Camera get_frame error: {e}")
             return None
     
     def release(self):
@@ -385,24 +405,58 @@ class VideoWidget(QWidget):
     def update_video(self):
         try:
             frame = self.client.get_video()
+            
+            # Handle different frame types with better cross-platform compatibility
             if frame is None:
                 frame = NOCAM_FRAME.copy()
-            elif ENABLE_ENCODE and isinstance(frame, (bytes, bytearray, np.ndarray)):
+            elif isinstance(frame, (bytes, bytearray)):
+                # Decode JPEG encoded frame (cross-platform format)
                 try:
-                    if isinstance(frame, (bytes, bytearray)):
-                        frame = cv2.imdecode(np.frombuffer(frame, np.uint8), cv2.IMREAD_COLOR)
-                    elif isinstance(frame, np.ndarray) and len(frame.shape) == 1:
-                        frame = cv2.imdecode(frame, cv2.IMREAD_COLOR)
-                except Exception:
+                    frame_array = np.frombuffer(frame, np.uint8)
+                    decoded_frame = cv2.imdecode(frame_array, cv2.IMREAD_COLOR)
+                    if decoded_frame is not None:
+                        # OpenCV decodes JPEG as BGR, convert to RGB for display
+                        frame = cv2.cvtColor(decoded_frame, cv2.COLOR_BGR2RGB)
+                    else:
+                        print("[WARNING] Failed to decode video frame, using fallback")
+                        frame = NOCAM_FRAME.copy()
+                except Exception as e:
+                    print(f"[ERROR] Failed to decode video frame: {e}")
                     frame = NOCAM_FRAME.copy()
+            elif isinstance(frame, np.ndarray):
+                # Handle numpy array (could be encoded or raw)
+                if len(frame.shape) == 1:
+                    # This is encoded data as numpy array
+                    try:
+                        decoded_frame = cv2.imdecode(frame, cv2.IMREAD_COLOR)
+                        if decoded_frame is not None:
+                            frame = cv2.cvtColor(decoded_frame, cv2.COLOR_BGR2RGB)
+                        else:
+                            frame = NOCAM_FRAME.copy()
+                    except Exception as e:
+                        print(f"[ERROR] Failed to decode numpy video frame: {e}")
+                        frame = NOCAM_FRAME.copy()
+                elif len(frame.shape) == 3:
+                    # This is already a decoded frame (should be RGB)
+                    if frame.shape[2] == 3:
+                        # Frame is already in RGB format
+                        pass
+                    else:
+                        frame = NOCAM_FRAME.copy()
+                else:
+                    frame = NOCAM_FRAME.copy()
+            else:
+                frame = NOCAM_FRAME.copy()
             
-            if frame is None:
+            # Ensure frame is valid
+            if frame is None or not isinstance(frame, np.ndarray) or len(frame.shape) != 3:
                 frame = NOCAM_FRAME.copy()
                 
+            # Resize frame to standard size
             frame = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT), interpolation=cv2.INTER_AREA)
             
             # Add microphone indicator if audio is disabled
-            if hasattr(self.client, 'audio_data') and self.client.audio_data is None:
+            if hasattr(self.client, 'microphone_enabled') and not self.client.microphone_enabled:
                 try:
                     nomic_h, nomic_w, _ = NOMIC_FRAME.shape
                     x, y = FRAME_WIDTH//2 - nomic_w//2, FRAME_HEIGHT - 50
@@ -411,12 +465,14 @@ class VideoWidget(QWidget):
                 except Exception:
                     pass  # Skip microphone indicator if there's an error
 
+            # Convert to QImage and display
             h, w, ch = frame.shape
             bytes_per_line = ch * w
             q_img = QImage(frame.data, w, h, bytes_per_line, QImage.Format.Format_RGB888)
             self.video_viewer.setPixmap(QPixmap.fromImage(q_img))
             
-        except Exception:
+        except Exception as e:
+            print(f"[ERROR] VideoWidget update_video error: {e}")
             # Fallback to no camera frame on any error
             try:
                 frame = NOCAM_FRAME.copy()
@@ -1464,7 +1520,8 @@ class MainWindow(QMainWindow):
     
     def add_client(self, client):
         self.video_list_widget.add_client(client)
-        if ENABLE_AUDIO:
+        # Only create audio thread for OTHER clients, not for current user
+        if ENABLE_AUDIO and not client.current_device:
             self.audio_threads[client.name] = AudioThread(client, self)
             self.audio_threads[client.name].start()
         if not client.current_device:
