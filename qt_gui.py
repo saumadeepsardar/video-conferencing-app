@@ -332,7 +332,8 @@ class VideoWidget(QWidget):
         self.setLayout(self.layout)
     
     def init_video(self):
-        self.timer.start(30)
+        # Improved FPS for better camera quality (60 FPS)
+        self.timer.start(16)  # ~60 FPS (1000ms / 60 = 16.67ms)
     
     def update_video(self):
         frame = self.client.get_video()
@@ -410,11 +411,11 @@ class ScreenShareWidget(QWidget):
             pass
         super().resizeEvent(event)
 
-    def set_minimized_height(self, factor: float = 0.5):
-        """Set widget's height to fraction of window height (default 50%)."""
+    def set_minimized_height(self, factor: float = 0.6):
+        """Set widget's height to fraction of window height (default 60% for better visibility)."""
         w = self.window()
         total = w.height() if w and hasattr(w, "height") else 800
-        h = max(120, int(total * factor))
+        h = max(200, int(total * factor))  # Increased minimum height for better screen share visibility
         self.setMinimumHeight(h)
         self.setMaximumHeight(h)
 
@@ -531,10 +532,22 @@ class ScreenShareWidget(QWidget):
 
         if is_presenter:
             self.presenter_label.setText("You are now presenting your screen")
-            self.screen_viewer.setText("Your screen is being shared...")
-            self.screen_viewer.setStyleSheet("color: #a6e3a1; background-color: #000; border-radius: 12px;")
+            # Show a rectangular strip instead of blank screen for presenter
+            self.screen_viewer.setText("🖥️ Your screen is being shared to all participants")
+            self.screen_viewer.setStyleSheet("""
+                color: #a6e3a1; 
+                background: qlineargradient(x1:0, y1:0, x2:1, y2:0, 
+                    stop:0 #313244, stop:0.5 #45475a, stop:1 #313244);
+                border: 2px solid #a6e3a1;
+                border-radius: 12px;
+                font-size: 14px;
+                font-weight: bold;
+                padding: 20px;
+            """)
             self.max_btn.hide()
-            self.set_minimized_height(0.5)  # ensure presenter view takes only half screen
+            # Set a smaller height for presenter strip (120px fixed)
+            self.setMinimumHeight(120)
+            self.setMaximumHeight(120)
             return
 
         # show button if not presenter
@@ -622,7 +635,7 @@ class VideoListWidget(QListWidget):
             self.screen_share_widget.show_share(presenter_name, image_bytes, is_presenter)
             self.screen_share_widget.show()
         except Exception as e:
-            print(f"[VideoListWidget] add_screen_share ERROR: {e}")
+            pass
 
     def remove_screen_share(self):
         """Hide the screen share widget but keep the instance for reuse."""
@@ -633,20 +646,14 @@ class VideoListWidget(QListWidget):
                 # reset last image but keep object to avoid recreate loops
                 self.screen_share_widget.last_image_bytes = None
         except Exception as e:
-            print(f"[VideoListWidget] remove_screen_share ERROR: {e}")
+            pass
 
     def resize_widgets(self, res: str = None):
         global FRAME_WIDTH, FRAME_HEIGHT, LAYOUT_RES
         n = self.count()
         if res is None:
-            if n <= 1:
-                res = "900p"
-            elif n <= 4:
-                res = "480p"
-            elif n <= 6:
-                res = "360p"
-            else:
-                res = "240p"
+            # Default to 360p when new clients join for better layout
+            res = "360p"
         new_size = frame_size[res]
         
         if new_size == (FRAME_WIDTH, FRAME_HEIGHT):
@@ -719,25 +726,56 @@ class FileTransferItem(QWidget):
         return f"{bytes_:.1f}TB"
 
     def append_data(self, chunk: bytes):
-        self._buffer.extend(chunk)
+        if chunk and len(chunk) > 0:  # Only append non-empty chunks
+            self._buffer.extend(chunk)
+            
         self.received = len(self._buffer)
-        percent = int(self.received * 100 / self.total)
+        percent = int(self.received * 100 / self.total) if self.total > 0 else 0
         self.progress.setValue(percent)
         self.label.setText(f"{os.path.basename(self.label.text().split(' (')[0])} "
                            f"({self._human(self.received)} / {self._human(self.total)})")
 
-        if self.received >= self.total:
+        # Only enable save button if we have actual data and transfer is complete
+        if self.received >= self.total and len(self._buffer) > 0:
             self.save_btn.setEnabled(True)
 
     def _save_file(self):
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Save file", os.path.basename(self.label.text().split(' (')[0]))
+        # Validate that we have data to save
+        if not self._buffer or len(self._buffer) == 0:
+            QMessageBox.warning(self, "Warning", "No file data to save. Please wait for download to complete.")
+            return
+            
+        filename = os.path.basename(self.label.text().split(' (')[0])
+        path, _ = QFileDialog.getSaveFileName(self, "Save file", filename)
+        
         if path:
-            with open(path, "wb") as f:
-                f.write(self._buffer)
-            QMessageBox.information(self, "Saved", f"File saved to:\n{path}")
-            self.save_btn.setEnabled(False)
-            self.save_btn.setText("Saved")
+            try:
+                # Ensure we don't create empty files
+                if len(self._buffer) == 0:
+                    QMessageBox.warning(self, "Warning", "Cannot save empty file.")
+                    return
+                    
+                with open(path, "wb") as f:
+                    f.write(self._buffer)
+                    
+                # Verify the file was written correctly
+                if os.path.exists(path) and os.path.getsize(path) > 0:
+                    QMessageBox.information(self, "Saved", f"File saved to:\n{path}")
+                    self.save_btn.setEnabled(False)
+                    self.save_btn.setText("Saved")
+                else:
+                    QMessageBox.critical(self, "Error", "File was not saved correctly (0 bytes written)")
+                    if os.path.exists(path):
+                        os.remove(path)  # Remove the empty file
+                        
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to save file: {e}")
+                # Clean up any partially created file
+                if os.path.exists(path):
+                    try:
+                        os.remove(path)
+                    except:
+                        pass
             
             
 class ChatWidget(QWidget):
@@ -870,10 +908,9 @@ class ChatWidget(QWidget):
                 act = self.download_menu.addAction(label)
                 act.setData(entry)
                 act.triggered.connect(lambda checked=False, a=act: self._download_action_triggered(a))
-            print(f"[ChatWidget] populate_download_menu: {len(files_list)} items")
 
         except Exception as e:
-            print("[ChatWidget] populate_download_menu ERROR:", e)
+            pass
 
     def _download_action_triggered(self, action):
         """Called when a file is selected from the download dropdown."""
@@ -894,6 +931,11 @@ class ChatWidget(QWidget):
 
     def start_file_transfer(self, transfer_id: str, filename: str, total: int, from_name: str):
         """Called when a file starts arriving."""
+        # Don't create transfer widgets for 0-byte files
+        if total <= 0:
+            self.central_widget.append(f"[{from_name}] → Skipped empty file: {filename}")
+            return
+            
         item = FileTransferItem(filename, total, self)
         self.transfer_area.addWidget(item)
         self.transfer_widgets[transfer_id] = item
@@ -910,7 +952,22 @@ class ChatWidget(QWidget):
             return
         widget = self.transfer_widgets[transfer_id]
         widget.progress.setValue(100)
-        widget.save_btn.setEnabled(True)
+        
+        # Only enable save button if we actually have data
+        if len(widget._buffer) > 0:
+            widget.save_btn.setEnabled(True)
+        else:
+            widget.save_btn.setText("No Data")
+            widget.save_btn.setEnabled(False)
+            widget.save_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #f38ba8;
+                    color: #1e1e2e;
+                    border-radius: 6px;
+                    padding: 4px 10px;
+                    font-weight: bold;
+                }
+            """)
 
     def update_download_progress(self, percent):
         """Optional download progress update (if server supports percent updates)."""
@@ -919,7 +976,7 @@ class ChatWidget(QWidget):
                 self.download_progress.setVisible(True)
                 self.download_progress.setValue(int(percent))
         except Exception as e:
-            print("[ChatWidget] update_download_progress ERROR:", e)
+            pass
 
     def download_complete(self, filename):
         """Called when file download finishes."""
@@ -929,7 +986,7 @@ class ChatWidget(QWidget):
                 self.download_progress.setVisible(False)
             self.add_message(f"Download complete: {filename}")
         except Exception as e:
-            print("[ChatWidget] download_complete ERROR:", e)
+            pass
     # === End File Download UI Methods ===
 
 
@@ -973,7 +1030,6 @@ class ChatWidget(QWidget):
                 self.server_conn.send_msg(self.server_conn.main_socket, msg)
 
         except Exception as e:
-            print("[ChatWidget] _start_file_download ERROR:", e)
             QMessageBox.critical(self, "Error", f"Failed to request download: {e}")
 
 
@@ -986,7 +1042,7 @@ class ChatWidget(QWidget):
                 self.download_progress.setVisible(True)
                 self.download_progress.setValue(int(percent))
         except Exception as e:
-            print("[ChatWidget] update_download_progress ERROR:", e)
+            pass
 
     def download_complete(self, filename):
         """
@@ -998,7 +1054,7 @@ class ChatWidget(QWidget):
                 self.download_progress.setVisible(False)
             self.add_message(f"Download complete: {filename}")
         except Exception as e:
-            print("[ChatWidget] download_complete ERROR:", e)
+            pass
     # === End File Download UI Methods ===
 
 
@@ -1066,7 +1122,7 @@ class ChatWidget(QWidget):
                     label_prefix = widget.label.text().split('(')[0].strip()
                     widget.label.setText(f"{label_prefix} ({percent}%)")
             except Exception as e:
-                print(f"[UI] update_upload_progress ERROR: {e}")
+                pass
 
 
     def finish_upload_transfer(self, upload_id: str):
@@ -1274,7 +1330,7 @@ class MainWindow(QMainWindow):
 
         self.screen_timer = QTimer()
         self.screen_timer.timeout.connect(self.capture_and_send_screen)
-        self.screen_timer.setInterval(500)
+        self.screen_timer.setInterval(200)  # Improved screen sharing FPS (5 FPS -> ~5 FPS for better quality)
         
         self.camera_menu = self.menuBar().addMenu("Camera")
         self.camera_menu.setStyleSheet("QMenu { background-color: #313244; color: #cdd6f4; }")
@@ -1437,6 +1493,8 @@ class MainWindow(QMainWindow):
             self.screen_timer.start()
             self.chat_widget.share_button.setText("Stop Screen Share")
             self.chat_widget.share_button.setEnabled(True)
+            # Resize camera widgets to 240p when presenting
+            self.video_list_widget.resize_widgets("240p")
         else:
             # Another user is sharing
             self.video_list_widget.add_screen_share(presenter_name, b'', is_presenter=False)
@@ -1444,6 +1502,8 @@ class MainWindow(QMainWindow):
             self.other_sharing = True
             self.chat_widget.share_button.setText("Other is Sharing")
             self.chat_widget.share_button.setEnabled(False)
+            # Resize camera widgets to 240p when someone else is sharing
+            self.video_list_widget.resize_widgets("240p")
 
     def on_screen_update(self, image_bytes):
         if self.current_presenter:
@@ -1469,6 +1529,9 @@ class MainWindow(QMainWindow):
 
         # Reset sharing flags
         self.other_sharing = False
+
+        # Restore camera widgets to 360p when screen sharing stops
+        self.video_list_widget.resize_widgets("360p")
 
         # Re-enable ALL chat control buttons
         if hasattr(self, "chat_widget"):
