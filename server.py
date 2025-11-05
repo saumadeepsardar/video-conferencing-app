@@ -161,7 +161,10 @@ def media_server(media: str, port: int):
         try:
             msg: Message = pickle.loads(msg_bytes)
         except (pickle.UnpicklingError, pickle.PickleError, EOFError, ValueError) as e:
-            print(f"[{addr}] [{media}] [ERROR] Pickle error: {e}")
+            print(f"[{addr}] [{media}] [ERROR] Pickle error (packet size: {len(msg_bytes)}): {e}")
+            continue
+        except Exception as e:
+            print(f"[{addr}] [{media}] [ERROR] Unexpected error: {e}")
             continue
             
         if msg.request == ADD:

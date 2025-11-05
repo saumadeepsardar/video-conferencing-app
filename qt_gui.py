@@ -253,8 +253,11 @@ class AudioThread(QThread):
         if hasattr(self.client, 'audio_data') and self.client.audio_data is not None and self.stream is not None:
             try:
                 self.stream.write(self.client.audio_data)
+                pass  # Audio playing
             except Exception as e:
-                print(f"[ERROR] Audio playback failed: {e}")
+                print(f"[ERROR] Audio playback failed for {self.client.name}: {e}")
+        else:
+            pass  # No audio data to play
 
 
 class Camera:
@@ -316,7 +319,7 @@ class Camera:
                 
                 if ENABLE_ENCODE:
                     # Keep frame in BGR for JPEG encoding (cross-platform compatibility)
-                    encode_param = [cv2.IMWRITE_JPEG_QUALITY, 80]
+                    encode_param = [cv2.IMWRITE_JPEG_QUALITY, 40]  # Very low quality to prevent truncation
                     success, encoded_frame = cv2.imencode('.jpg', frame, encode_param)
                     if success:
                         # Return as bytes for network transmission

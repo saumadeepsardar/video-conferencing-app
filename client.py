@@ -185,13 +185,23 @@ class ServerConnection(QThread):
             msg_bytes = pickle.dumps(msg, protocol=2)
 
             if msg.data_type == VIDEO and VIDEO_ADDR:
+                # Check packet size before sending - be more strict to prevent truncation
+                max_video_size = MEDIA_SIZE[VIDEO] - 2000  # Leave buffer for headers
+                if len(msg_bytes) > max_video_size:
+                    print(f"[WARNING] Video packet too large ({len(msg_bytes)} bytes > {max_video_size}), skipping")
+                    return
                 conn.sendto(msg_bytes, VIDEO_ADDR)
             elif msg.data_type == AUDIO and AUDIO_ADDR:
+                # Check packet size before sending
+                max_audio_size = MEDIA_SIZE[AUDIO] - 200  # Leave buffer for headers
+                if len(msg_bytes) > max_audio_size:
+                    print(f"[WARNING] Audio packet too large ({len(msg_bytes)} bytes > {max_audio_size}), skipping")
+                    return
                 conn.sendto(msg_bytes, AUDIO_ADDR)
             else:
                 conn.send_bytes(msg_bytes)
         except (BrokenPipeError, ConnectionResetError, OSError) as e:
-            print(f"[ERROR] Connection not present: {e}")
+            print(f"[ERROR] Connection error: {e}")
             self.connected = False
     
     def send_file(self, filepath: str, to_names: tuple[str]):

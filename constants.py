@@ -36,7 +36,7 @@ TEXT = 'Text'
 FILE = 'File'
 SCREEN = 'Screen'
 
-MEDIA_SIZE = {VIDEO: 25000, AUDIO: 4500}
+MEDIA_SIZE = {VIDEO: 65536, AUDIO: 8192}  # 64KB video, 8KB audio - balanced for stability
 
 # --- socket helpers (send/recv with length prefix) ---
 def send_bytes(self, msg: bytes):
