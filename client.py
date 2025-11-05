@@ -12,10 +12,10 @@ from qt_gui import MainWindow, Camera, Microphone, Worker, ScreenCapturer
 
 from constants import *
 
-IP = socket.gethostbyname(socket.gethostname())
-# IP = "192.168.12.1"
-VIDEO_ADDR = (IP, VIDEO_PORT)
-AUDIO_ADDR = (IP, AUDIO_PORT)
+# IP will be set from login dialog
+IP = None
+VIDEO_ADDR = None
+AUDIO_ADDR = None
 
 
 class Client:
@@ -46,7 +46,11 @@ class Client:
             return None
 
         if self.camera is not None:
-            self.video_frame = self.camera.get_frame()
+            try:
+                self.video_frame = self.camera.get_frame()
+            except Exception as e:
+                print(f"[ERROR] Failed to get video frame: {e}")
+                self.video_frame = None
 
         return self.video_frame
     
@@ -94,6 +98,7 @@ class ServerConnection(QThread):
         super().__init__(parent)
         self.threadpool = None
         self.name = None  # Set after login
+        self.server_ip = None  # Set from login dialog
 
         self.main_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.video_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -102,6 +107,7 @@ class ServerConnection(QThread):
         self.connected = False
         self.recieving_filename = None
         self.screen_broadcast_thread = None
+        self.window = None  # Reference to main window
 
     def run(self):
         self.init_conn()
@@ -118,7 +124,16 @@ class ServerConnection(QThread):
         self.disconnect_server()
 
     def init_conn(self):
+        global IP, VIDEO_ADDR, AUDIO_ADDR
         try:
+            # Get IP from login dialog
+            if hasattr(self, 'server_ip') and self.server_ip:
+                IP = self.server_ip
+                VIDEO_ADDR = (IP, VIDEO_PORT)
+                AUDIO_ADDR = (IP, AUDIO_PORT)
+            else:
+                raise Exception("Server IP not set")
+                
             self.main_socket.connect((IP, MAIN_PORT))
 
             self.main_socket.send_bytes(self.name.encode())
@@ -126,7 +141,8 @@ class ServerConnection(QThread):
             if conn_status != OK:
                 QMessageBox.critical(None, "Error", conn_status)
                 self.main_socket.close()
-                window.close()
+                if hasattr(self, 'window') and self.window:
+                    self.window.close()
                 self.connected = False
                 return
             
@@ -162,17 +178,18 @@ class ServerConnection(QThread):
         self.connected = False
     
     def send_msg(self, conn: socket.socket, msg: Message):
-        msg_bytes = pickle.dumps(msg)
-
         try:
-            if msg.data_type == VIDEO:
+            # Use protocol 2 for better cross-platform compatibility
+            msg_bytes = pickle.dumps(msg, protocol=2)
+
+            if msg.data_type == VIDEO and VIDEO_ADDR:
                 conn.sendto(msg_bytes, VIDEO_ADDR)
-            elif msg.data_type == AUDIO:
+            elif msg.data_type == AUDIO and AUDIO_ADDR:
                 conn.sendto(msg_bytes, AUDIO_ADDR)
             else:
                 conn.send_bytes(msg_bytes)
-        except (BrokenPipeError, ConnectionResetError, OSError):
-            print(f"[ERROR] Connection not present")
+        except (BrokenPipeError, ConnectionResetError, OSError) as e:
+            print(f"[ERROR] Connection not present: {e}")
             self.connected = False
     
     def send_file(self, filepath: str, to_names: tuple[str]):
@@ -242,18 +259,26 @@ class ServerConnection(QThread):
 
     def media_broadcast_loop(self, conn: socket.socket, media: str):
         while self.connected:
-            if media == VIDEO:
-                data = client.get_video()
-            elif media == AUDIO:
-                data = client.get_audio()
-            else:
-                break
-            if data is None:
-                time.sleep(1/60)
+            try:
+                if media == VIDEO:
+                    data = client.get_video()
+                elif media == AUDIO:
+                    data = client.get_audio()
+                else:
+                    break
+                    
+                if data is None:
+                    time.sleep(1/30)  # Reduced FPS when no data to save bandwidth
+                    continue
+                    
+                msg = Message(self.name, POST, media, data)
+                self.send_msg(conn, msg)
+                time.sleep(1/30)  # 30 FPS for better stability and bandwidth usage
+                
+            except Exception as e:
+                print(f"[ERROR] Media broadcast error ({media}): {e}")
+                time.sleep(0.1)
                 continue
-            msg = Message(self.name, POST, media, data)
-            self.send_msg(conn, msg)
-            time.sleep(1/60)  # Improved to ~60 FPS for better video quality
 
     def handle_conn(self, conn: socket.socket, media: str):
         while self.connected:
@@ -266,8 +291,8 @@ class ServerConnection(QThread):
                 break
             try:
                 msg = pickle.loads(msg_bytes)
-            except pickle.UnpicklingError:
-                print(f"[{self.name}] [{media}] [ERROR] UnpicklingError")
+            except (pickle.UnpicklingError, pickle.PickleError, EOFError, ValueError) as e:
+                print(f"[{self.name}] [{media}] [ERROR] Pickle error: {e}")
                 continue
 
             if msg.request == DISCONNECT:
@@ -296,9 +321,11 @@ class ServerConnection(QThread):
                     all_clients[client_name] = Client(client_name)
                     self.add_client_signal.emit(all_clients[client_name])
             if msg.data_type == VIDEO:
-                all_clients[client_name].video_frame = msg.data
+                if client_name in all_clients:
+                    all_clients[client_name].video_frame = msg.data
             elif msg.data_type == AUDIO:
-                all_clients[client_name].audio_data = msg.data
+                if client_name in all_clients:
+                    all_clients[client_name].audio_data = msg.data
             elif msg.data_type == SCREEN:
                 self.screen_update_signal.emit(msg.data)
             if msg.data_type == TEXT:
@@ -417,6 +444,7 @@ if __name__ == "__main__":
 
     server_conn = ServerConnection()
     window = MainWindow(client, server_conn)
+    server_conn.window = window  # Set window reference for error handling
     window.show()
 
     status_code = app.exec()
