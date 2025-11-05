@@ -11,7 +11,6 @@ from PyQt6.QtWidgets import QApplication, QMessageBox
 from qt_gui import MainWindow, Camera, Microphone, Worker, ScreenCapturer
 
 from constants import *
-from constants import MEDIA_SIZE
 
 # IP will be set from login dialog
 IP = None
@@ -49,7 +48,6 @@ class Client:
         if self.camera is not None:
             try:
                 self.video_frame = self.camera.get_frame()
-                pass  # Video frame captured successfully
             except Exception as e:
                 print(f"[ERROR] Failed to get video frame: {e}")
                 self.video_frame = None
@@ -185,21 +183,13 @@ class ServerConnection(QThread):
             msg_bytes = pickle.dumps(msg, protocol=2)
 
             if msg.data_type == VIDEO and VIDEO_ADDR:
-                # Check packet size before sending
-                if len(msg_bytes) > MEDIA_SIZE[VIDEO]:
-                    print(f"[WARNING] Video packet too large ({len(msg_bytes)} bytes), skipping")
-                    return
                 conn.sendto(msg_bytes, VIDEO_ADDR)
             elif msg.data_type == AUDIO and AUDIO_ADDR:
-                # Check packet size before sending
-                if len(msg_bytes) > MEDIA_SIZE[AUDIO]:
-                    print(f"[WARNING] Audio packet too large ({len(msg_bytes)} bytes), skipping")
-                    return
                 conn.sendto(msg_bytes, AUDIO_ADDR)
             else:
                 conn.send_bytes(msg_bytes)
         except (BrokenPipeError, ConnectionResetError, OSError) as e:
-            print(f"[ERROR] Connection error: {e}")
+            print(f"[ERROR] Connection not present: {e}")
             self.connected = False
     
     def send_file(self, filepath: str, to_names: tuple[str]):

@@ -144,20 +144,7 @@ def media_server(media: str, port: int):
     conn.bind((IP, port))
     print(f"[LISTENING] {media} Server is listening on {IP}:{port}")
     while True:
-        try:
-            msg_bytes, addr = conn.recvfrom(MEDIA_SIZE[media])
-        except OSError as e:
-            if "10040" in str(e) or "message larger than" in str(e).lower():
-                # Datagram too large, skip it
-                print(f"[{media}] Skipping oversized packet")
-                continue
-            else:
-                print(f"[{media}] Network error: {e}")
-                continue
-        except Exception as e:
-            print(f"[{media}] Receive error: {e}")
-            continue
-            
+        msg_bytes, addr = conn.recvfrom(MEDIA_SIZE[media])
         try:
             msg: Message = pickle.loads(msg_bytes)
         except (pickle.UnpicklingError, pickle.PickleError, EOFError, ValueError) as e:
