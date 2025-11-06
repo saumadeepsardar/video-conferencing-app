@@ -3,7 +3,7 @@
 # --- Activate the virtual environment ---
 # Note the path is different on Linux
 echo "Activating virtual environment..."
-source video/bin/activate
+source venv/bin/activate
 
 # --- Show menu ---
 echo
