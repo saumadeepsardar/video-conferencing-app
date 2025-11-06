@@ -1,6 +1,6 @@
 # LAN Multi-User Communication Suite
 
-A self-hosted, server-based application for complete team collaboration over a Local Area Network (LAN), with no internet connection required.
+A server-based application for complete team collaboration over a Local Area Network (LAN), with no internet connection required and cross-platform i.e Windows and Linux.
 
 ## 📌 Introduction
 
@@ -26,8 +26,8 @@ Follow these instructions to get a local copy up and running.
 
 1.  **Clone the repository:**
     ```bash
-    git clone [https://github.com/your-username/your-repository-name.git](https://github.com/your-username/your-repository-name.git)
-    cd your-repository-name
+    git clone https://github.com/saumadeepsardar/video-conferencing-app.git
+    cd video-conferencing-app
     ```
 
 2.  **Create a virtual environment:**
